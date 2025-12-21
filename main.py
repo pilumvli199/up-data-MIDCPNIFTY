@@ -1,489 +1,546 @@
-"""
-Upstox Option Chain + Chart Telegram Bot
-5-minute TF candlestick + ±5 ATM strikes
-Single PNG with chart + option data
-"""
-
-import os
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import pytz
-import time
-from io import BytesIO
+from datetime import datetime, time as dt_time, timedelta
+import json
+import logging
+from typing import Dict, List, Optional
+from telegram import Bot
+from telegram.error import TelegramError
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
-import schedule
-from dotenv import load_dotenv
+import mplfinance as mpf
+from io import BytesIO
+import pytz
 
-load_dotenv()
+# ======================== CONFIGURATION ========================
+import os
 
-# ===================== CONFIG =====================
-UPSTOX_API_KEY = os.getenv('UPSTOX_API_KEY')
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+UPSTOX_API_URL = "https://api.upstox.com/v2"
+UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-BASE_URL = "https://api.upstox.com/v2"
+# Trading params
+ANALYSIS_INTERVAL = 5 * 60  # 5 minutes
+CANDLES_COUNT = 50
+ATM_RANGE = 5  # ±5 strikes
+
+# Market hours (IST)
+MARKET_START = dt_time(9, 15)
+MARKET_END = dt_time(15, 30)
 IST = pytz.timezone('Asia/Kolkata')
 
-# Symbols to track
-INDICES = ['NIFTY', 'BANKNIFTY', 'MIDCPNIFTY', 'FINNIFTY']
-
+# NIFTY 50 stocks with ISIN codes (NSE symbols)
 NIFTY50_STOCKS = [
-    'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK',
-    'BAJAJ_AUTO', 'BAJFINANCE', 'BAJAJFINSV', 'BPCL', 'BHARTIARTL',
-    'BRITANNIA', 'CIPLA', 'COALINDIA', 'DIVISLAB', 'DRREDDY',
-    'EICHERMOT', 'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE',
-    'HEROMOTOCO', 'HINDALCO', 'HINDUNILVR', 'ICICIBANK', 'ITC',
-    'INDUSINDBK', 'INFY', 'JSWSTEEL', 'KOTAKBANK', 'LT',
-    'M&M', 'MARUTI', 'NTPC', 'NESTLEIND', 'ONGC',
-    'POWERGRID', 'RELIANCE', 'SBILIFE', 'SBIN', 'SUNPHARMA',
-    'TCS', 'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TECHM',
-    'TITAN', 'ULTRACEMCO', 'UPL', 'WIPRO', 'LTIM'
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
+    "SBIN", "BHARTIARTL", "BAJFINANCE", "KOTAKBANK", "LT", "ASIANPAINT", 
+    "AXISBANK", "MARUTI", "SUNPHARMA", "TITAN", "ULTRACEMCO", "NESTLEIND",
+    "WIPRO", "M&M", "NTPC", "HCLTECH", "TATAMOTORS", "TATASTEEL", "POWERGRID",
+    "BAJAJFINSV", "ONGC", "TECHM", "ADANIENT", "COALINDIA", "JSWSTEEL",
+    "INDUSINDBK", "GRASIM", "HINDALCO", "HDFCLIFE", "BRITANNIA", "CIPLA",
+    "BPCL", "EICHERMOT", "DRREDDY", "APOLLOHOSP", "DIVISLAB", "SBILIFE",
+    "BAJAJ-AUTO", "TATACONSUM", "HEROMOTOCO", "ADANIPORTS", "LTIM", "UPL"
 ]
 
-ALL_SYMBOLS = INDICES + NIFTY50_STOCKS
+INDICES = ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY"]
 
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# ===================== UPSTOX API FUNCTIONS =====================
-
-def get_instrument_key(symbol):
-    """Convert symbol to Upstox instrument key"""
-    if symbol in INDICES:
-        return f"NSE_INDEX|{symbol}"
-    else:
-        return f"NSE_EQ|{symbol}"
-
-
-def get_option_chain(symbol, expiry_date):
-    """Fetch option chain from Upstox"""
-    url = f"{BASE_URL}/option/chain"
-    
-    headers = {
-        'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}',
-        'Accept': 'application/json'
-    }
-    
-    params = {
-        'instrument_key': get_instrument_key(symbol),
-        'expiry_date': expiry_date
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"❌ Option Chain Error ({symbol}): {e}")
-        return None
-
-
-def get_historical_candles(symbol, interval='5minute', days_back=1):
-    """Fetch historical candlestick data (last 50 candles)"""
-    
-    # Get current date in IST
-    to_date = datetime.now(IST).strftime('%Y-%m-%d')
-    
-    url = f"{BASE_URL}/historical-candle/{get_instrument_key(symbol)}/{interval}/{to_date}"
-    
-    headers = {
-        'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}',
-        'Accept': 'application/json'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data['status'] == 'success' and 'data' in data and 'candles' in data['data']:
-            candles = data['data']['candles'][:50]  # Last 50 candles
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp').reset_index(drop=True)
-            
-            return df
-        else:
-            print(f"❌ No candle data for {symbol}")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Historical Data Error ({symbol}): {e}")
-        return None
-
-
-def get_ltp(symbol):
-    """Get Last Traded Price"""
-    url = f"{BASE_URL}/market-quote/ltp"
-    
-    headers = {
-        'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}',
-        'Accept': 'application/json'
-    }
-    
-    params = {
-        'instrument_key': get_instrument_key(symbol)
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data['status'] == 'success':
-            return data['data'][get_instrument_key(symbol)]['last_price']
-        return None
-    except Exception as e:
-        print(f"❌ LTP Error ({symbol}): {e}")
-        return None
-
-
-def get_nearest_expiry():
-    """Get nearest weekly expiry (Thursday for NIFTY/BANKNIFTY)"""
-    today = datetime.now(IST).date()
-    days_ahead = (3 - today.weekday()) % 7  # Thursday = 3
-    
-    if days_ahead == 0 and datetime.now(IST).hour >= 15:  # After 3:30 PM
-        days_ahead = 7
-    
-    expiry = today + timedelta(days=days_ahead)
-    return expiry.strftime('%Y-%m-%d')
-
-
-def process_option_chain_data(symbol):
-    """Process option chain and extract ±5 ATM strikes"""
-    
-    # Get LTP for ATM calculation
-    ltp = get_ltp(symbol)
-    if not ltp:
-        return None
-    
-    # Get option chain
-    expiry = get_nearest_expiry()
-    chain_data = get_option_chain(symbol, expiry)
-    
-    if not chain_data or 'data' not in chain_data:
-        return None
-    
-    # Find ATM strike
-    strike_interval = 50 if symbol in ['NIFTY', 'FINNIFTY'] else 100
-    atm_strike = round(ltp / strike_interval) * strike_interval
-    
-    # Extract ±5 strikes
-    strikes_to_fetch = [atm_strike + (i * strike_interval) for i in range(-5, 6)]
-    
-    option_data = []
-    
-    for strike in strikes_to_fetch:
-        ce_data = pe_data = None
-        
-        for item in chain_data['data']:
-            if item['strike_price'] == strike:
-                if item['option_type'] == 'CE':
-                    ce_data = item
-                elif item['option_type'] == 'PE':
-                    pe_data = item
-        
-        if ce_data and pe_data:
-            option_data.append({
-                'Strike': strike,
-                'CE_OI': ce_data.get('open_interest', 0),
-                'CE_Volume': ce_data.get('volume', 0),
-                'CE_LTP': ce_data.get('last_price', 0),
-                'PE_LTP': pe_data.get('last_price', 0),
-                'PE_Volume': pe_data.get('volume', 0),
-                'PE_OI': pe_data.get('open_interest', 0)
-            })
-    
-    df = pd.DataFrame(option_data)
-    
-    if not df.empty:
-        # Calculate PCR
-        total_ce_oi = df['CE_OI'].sum()
-        total_pe_oi = df['PE_OI'].sum()
-        pcr_oi = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-        
-        total_ce_vol = df['CE_Volume'].sum()
-        total_pe_vol = df['PE_Volume'].sum()
-        pcr_vol = round(total_pe_vol / total_ce_vol, 2) if total_ce_vol > 0 else 0
-        
-        return {
-            'symbol': symbol,
-            'ltp': ltp,
-            'atm_strike': atm_strike,
-            'data': df,
-            'pcr_oi': pcr_oi,
-            'pcr_volume': pcr_vol
+# ======================== UPSTOX API CLIENT ========================
+class UpstoxClient:
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.session = None
+        self.headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
         }
-    
-    return None
-
-
-# ===================== CHART GENERATION =====================
-
-def create_candlestick_only_chart(symbol, candle_df):
-    """Create candlestick chart only (for stocks without options)"""
-    
-    plt.style.use('seaborn-v0_8-whitegrid')
-    
-    fig = plt.figure(figsize=(14, 8), facecolor='white')
-    ax = fig.add_subplot(111)
-    ax.set_facecolor('white')
-    
-    # Draw candlesticks
-    for idx, row in candle_df.iterrows():
-        color = 'green' if row['close'] >= row['open'] else 'red'
         
-        # Candle body
-        height = abs(row['close'] - row['open'])
-        bottom = min(row['open'], row['close'])
-        ax.bar(idx, height, bottom=bottom, width=0.6, color=color, alpha=0.8)
+    async def create_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession(headers=self.headers)
+    
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+    
+    def get_instrument_key(self, symbol: str, segment: str = "NSE_INDEX") -> str:
+        """Get Upstox instrument key"""
+        # For indices: NSE_INDEX|Nifty 50
+        # For stocks: NSE_EQ|INE002A01018 (ISIN)
+        # For options: NFO|NIFTY24DEC19C24000
         
-        # Wicks
-        ax.plot([idx, idx], [row['low'], row['high']], color=color, linewidth=0.8)
+        if symbol in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY"]:
+            mapping = {
+                "NIFTY": "NSE_INDEX|Nifty 50",
+                "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+                "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+                "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
+            }
+            return mapping.get(symbol, f"NSE_INDEX|{symbol}")
+        else:
+            # Stock - use NSE_EQ segment with symbol
+            return f"NSE_EQ|{symbol}"
     
-    # Styling
-    ax.set_title(f"{symbol} - 5 Min Candlestick Chart", fontsize=16, fontweight='bold', color='black')
-    ax.set_xlabel('Time', fontsize=12, color='black')
-    ax.set_ylabel('Price', fontsize=12, color='black')
-    ax.grid(True, alpha=0.3, color='gray')
-    ax.tick_params(colors='black')
+    async def get_ltp(self, instrument_key: str) -> float:
+        """Get Last Traded Price"""
+        try:
+            url = f"{UPSTOX_API_URL}/market-quote/ltp"
+            params = {"instrument_key": instrument_key}
+            
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data.get("status") == "success":
+                    return data["data"][instrument_key]["last_price"]
+                return 0.0
+        except Exception as e:
+            logger.error(f"❌ Error fetching LTP: {e}")
+            return 0.0
     
-    # Add current price
-    current_price = candle_df.iloc[-1]['close']
-    ax.text(0.98, 0.98, f"LTP: ₹{current_price:.2f}", 
-            transform=ax.transAxes, fontsize=14, fontweight='bold',
-            verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', edgecolor='black'))
+    async def get_historical_candles(self, instrument_key: str, count: int = 50) -> pd.DataFrame:
+        """Get historical intraday candles (5 min)"""
+        try:
+            url = f"{UPSTOX_API_URL}/historical-candle/intraday/{instrument_key}/5minute"
+            
+            async with self.session.get(url) as response:
+                data = await response.json()
+                
+                if data.get("status") == "success" and data.get("data", {}).get("candles"):
+                    candles = data["data"]["candles"][:count]
+                    
+                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+                    df = df.sort_index()
+                    
+                    return df
+                
+                return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"❌ Error fetching candles: {e}")
+            return pd.DataFrame()
     
-    # Save to buffer
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=100, facecolor='white', bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
+    async def get_option_chain(self, symbol: str, expiry: str) -> Dict:
+        """Get option chain data"""
+        try:
+            # Upstox option chain endpoint
+            url = f"{UPSTOX_API_URL}/option/chain"
+            params = {
+                "instrument_key": self.get_instrument_key(symbol),
+                "expiry_date": expiry
+            }
+            
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data.get("status") == "success":
+                    return data["data"]
+                
+                return {}
+        except Exception as e:
+            logger.error(f"❌ Error fetching option chain: {e}")
+            return {}
     
-    return buf
+    async def get_expiries(self, symbol: str) -> List[str]:
+        """Get available expiries for symbol"""
+        try:
+            # This is a placeholder - Upstox may have different endpoint
+            # For now, calculate nearest Thursday (weekly) / last Thursday (monthly)
+            
+            today = datetime.now(IST).date()
+            
+            # Find next Thursday
+            days_ahead = (3 - today.weekday()) % 7  # Thursday = 3
+            if days_ahead == 0:
+                days_ahead = 7
+            
+            next_expiry = today + timedelta(days=days_ahead)
+            
+            return [next_expiry.strftime("%Y-%m-%d")]
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating expiry: {e}")
+            return []
 
+# ======================== OPTION CHAIN ANALYZER ========================
+class OptionAnalyzer:
+    def __init__(self, client: UpstoxClient):
+        self.client = client
+    
+    async def get_atm_strikes(self, current_price: float, symbol: str) -> List[float]:
+        """Calculate ATM ±5 strikes"""
+        # Determine strike interval based on symbol
+        intervals = {
+            "NIFTY": 50,
+            "BANKNIFTY": 100,
+            "MIDCPNIFTY": 25,
+            "FINNIFTY": 50
+        }
+        
+        interval = intervals.get(symbol, 100)  # Default 100 for stocks
+        
+        # Round to nearest strike
+        atm = round(current_price / interval) * interval
+        
+        strikes = []
+        for i in range(-ATM_RANGE, ATM_RANGE + 1):
+            strikes.append(atm + (i * interval))
+        
+        return sorted(strikes)
+    
+    async def fetch_strike_data(self, symbol: str, expiry: str, strike: float, option_type: str) -> Dict:
+        """Fetch data for a specific strike"""
+        try:
+            # Build option instrument key
+            # Format: NFO|NIFTY24DEC19C24000
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d")
+            exp_str = exp_date.strftime("%y%b%d").upper()
+            
+            opt_type = "C" if option_type == "CE" else "P"
+            strike_str = str(int(strike))
+            
+            instrument_key = f"NFO|{symbol}{exp_str}{opt_type}{strike_str}"
+            
+            # Get LTP
+            ltp = await self.client.get_ltp(instrument_key)
+            
+            # For OI and volume, we'd need market depth/quote endpoint
+            # Placeholder for now
+            oi = 0
+            volume = 0
+            
+            return {
+                "strike": strike,
+                "ltp": ltp,
+                "oi": oi,
+                "volume": volume
+            }
+            
+        except Exception as e:
+            logger.debug(f"Error fetching {option_type} {strike}: {e}")
+            return {
+                "strike": strike,
+                "ltp": 0,
+                "oi": 0,
+                "volume": 0
+            }
+    
+    async def analyze_symbol(self, symbol: str) -> Optional[Dict]:
+        """Complete analysis for a symbol"""
+        try:
+            logger.info(f"📊 Analyzing {symbol}...")
+            
+            # Get current price
+            instrument_key = self.client.get_instrument_key(symbol)
+            current_price = await self.client.get_ltp(instrument_key)
+            
+            if current_price == 0:
+                logger.warning(f"⚠️ Could not fetch price for {symbol}")
+                return None
+            
+            logger.info(f"   💰 LTP: ₹{current_price:,.2f}")
+            
+            # Get candles
+            candles = await self.client.get_historical_candles(instrument_key, CANDLES_COUNT)
+            
+            if candles.empty:
+                logger.warning(f"⚠️ No candle data for {symbol}")
+                return None
+            
+            logger.info(f"   📈 Fetched {len(candles)} candles")
+            
+            # Get nearest expiry
+            expiries = await self.client.get_expiries(symbol)
+            if not expiries:
+                logger.warning(f"⚠️ No expiry found for {symbol}")
+                return None
+            
+            expiry = expiries[0]
+            logger.info(f"   📅 Expiry: {expiry}")
+            
+            # Get ATM strikes
+            strikes = await self.get_atm_strikes(current_price, symbol)
+            logger.info(f"   🎯 Strikes: {strikes[0]} to {strikes[-1]}")
+            
+            # Fetch option data for all strikes
+            ce_data = []
+            pe_data = []
+            
+            for strike in strikes:
+                ce = await self.fetch_strike_data(symbol, expiry, strike, "CE")
+                pe = await self.fetch_strike_data(symbol, expiry, strike, "PE")
+                
+                ce_data.append(ce)
+                pe_data.append(pe)
+                
+                await asyncio.sleep(0.1)  # Rate limiting
+            
+            # Calculate PCR
+            total_ce_oi = sum(d["oi"] for d in ce_data)
+            total_pe_oi = sum(d["oi"] for d in pe_data)
+            total_ce_vol = sum(d["volume"] for d in ce_data)
+            total_pe_vol = sum(d["volume"] for d in pe_data)
+            
+            pcr_oi = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            pcr_vol = total_pe_vol / total_ce_vol if total_ce_vol > 0 else 0
+            
+            return {
+                "symbol": symbol,
+                "current_price": current_price,
+                "expiry": expiry,
+                "candles": candles,
+                "strikes": strikes,
+                "ce_data": ce_data,
+                "pe_data": pe_data,
+                "pcr_oi": pcr_oi,
+                "pcr_vol": pcr_vol
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error analyzing {symbol}: {e}")
+            return None
 
-def create_combined_chart(symbol, candle_df, option_data):
-    """Create single PNG with candlestick + option chain"""
-    
-    # Set white background style
-    plt.style.use('seaborn-v0_8-whitegrid')
-    
-    fig = plt.figure(figsize=(16, 12), facecolor='white')
-    gs = GridSpec(3, 1, height_ratios=[2.5, 1, 0.3], hspace=0.3)
-    
-    # ========== CANDLESTICK CHART ==========
-    ax1 = fig.add_subplot(gs[0])
-    ax1.set_facecolor('white')
-    
-    for idx, row in candle_df.iterrows():
-        color = 'green' if row['close'] >= row['open'] else 'red'
+# ======================== CHART GENERATOR ========================
+class ChartGenerator:
+    @staticmethod
+    def create_combined_chart(analysis: Dict) -> BytesIO:
+        """Create combined candlestick + option chain PNG"""
+        symbol = analysis["symbol"]
+        candles = analysis["candles"]
+        current_price = analysis["current_price"]
         
-        # Candle body
-        height = abs(row['close'] - row['open'])
-        bottom = min(row['open'], row['close'])
-        ax1.bar(idx, height, bottom=bottom, width=0.6, color=color, alpha=0.8)
+        # Create figure with GridSpec
+        fig = plt.figure(figsize=(16, 12), facecolor='white')
+        gs = GridSpec(3, 1, height_ratios=[2, 1, 1], hspace=0.3)
         
-        # Wicks
-        ax1.plot([idx, idx], [row['low'], row['high']], color=color, linewidth=0.8)
-    
-    ax1.set_title(f"{symbol} - 5 Min Candlestick Chart", fontsize=16, fontweight='bold', color='black')
-    ax1.set_ylabel('Price', fontsize=12, color='black')
-    ax1.grid(True, alpha=0.3, color='gray')
-    ax1.tick_params(colors='black')
-    
-    # ========== OPTION CHAIN TABLE ==========
-    ax2 = fig.add_subplot(gs[1])
-    ax2.axis('tight')
-    ax2.axis('off')
-    
-    # Prepare table data
-    table_data = []
-    headers = ['Strike', 'CE OI', 'CE Vol', 'CE LTP', 'PE LTP', 'PE Vol', 'PE OI']
-    
-    for _, row in option_data['data'].iterrows():
-        strike_color = 'lightgreen' if row['Strike'] == option_data['atm_strike'] else 'white'
+        # ========== CANDLESTICK CHART ==========
+        ax1 = fig.add_subplot(gs[0])
+        
+        # Custom style (TradingView white)
+        mc = mpf.make_marketcolors(
+            up='#26a69a', down='#ef5350',
+            edge='inherit',
+            wick={'up': '#26a69a', 'down': '#ef5350'},
+            volume='in',
+            alpha=0.9
+        )
+        
+        s = mpf.make_mpf_style(
+            marketcolors=mc,
+            gridstyle='--',
+            gridcolor='#e0e0e0',
+            facecolor='white',
+            figcolor='white',
+            y_on_right=False
+        )
+        
+        # Plot candlestick
+        mpf.plot(
+            candles,
+            type='candle',
+            style=s,
+            ax=ax1,
+            volume=False,
+            show_nontrading=False
+        )
+        
+        ax1.set_title(f"{symbol} - 5min Chart | LTP: ₹{current_price:,.2f}", 
+                     fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        
+        # ========== OPTION CHAIN TABLE ==========
+        ax2 = fig.add_subplot(gs[1:])
+        ax2.axis('tight')
+        ax2.axis('off')
+        
+        # Prepare table data
+        table_data = [["Strike", "CE OI", "CE Vol", "CE LTP", "PE LTP", "PE Vol", "PE OI"]]
+        
+        for i, strike in enumerate(analysis["strikes"]):
+            ce = analysis["ce_data"][i]
+            pe = analysis["pe_data"][i]
+            
+            row = [
+                f"₹{strike:,.0f}",
+                f"{ce['oi']:,}",
+                f"{ce['volume']:,}",
+                f"₹{ce['ltp']:.2f}",
+                f"₹{pe['ltp']:.2f}",
+                f"{pe['volume']:,}",
+                f"{pe['oi']:,}"
+            ]
+            table_data.append(row)
+        
+        # Add PCR row
         table_data.append([
-            f"{int(row['Strike'])}",
-            f"{int(row['CE_OI']):,}",
-            f"{int(row['CE_Volume']):,}",
-            f"{row['CE_LTP']:.2f}",
-            f"{row['PE_LTP']:.2f}",
-            f"{int(row['PE_Volume']):,}",
-            f"{int(row['PE_OI']):,}"
+            "PCR",
+            "",
+            "",
+            f"OI: {analysis['pcr_oi']:.2f}",
+            f"Vol: {analysis['pcr_vol']:.2f}",
+            "",
+            ""
         ])
-    
-    table = ax2.table(cellText=table_data, colLabels=headers, 
-                     cellLoc='center', loc='center',
-                     colWidths=[0.12, 0.13, 0.13, 0.12, 0.12, 0.13, 0.13])
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1, 2)
-    
-    # Style table
-    for (i, j), cell in table.get_celld().items():
-        if i == 0:  # Header row
-            cell.set_facecolor('#4472C4')
-            cell.set_text_props(weight='bold', color='white')
-        else:
-            if option_data['data'].iloc[i-1]['Strike'] == option_data['atm_strike']:
-                cell.set_facecolor('lightgreen')
-            else:
-                cell.set_facecolor('white')
-            cell.set_edgecolor('gray')
-    
-    # ========== PCR INFO BOX ==========
-    ax3 = fig.add_subplot(gs[2])
-    ax3.axis('off')
-    
-    info_text = f"""LTP: ₹{option_data['ltp']:.2f}  |  ATM: {option_data['atm_strike']}  |  PCR (OI): {option_data['pcr_oi']}  |  PCR (Volume): {option_data['pcr_volume']}"""
-    
-    ax3.text(0.5, 0.5, info_text, ha='center', va='center', 
-            fontsize=12, fontweight='bold', color='black',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', edgecolor='black'))
-    
-    # Save to BytesIO
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=100, facecolor='white', bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
-
-
-# ===================== TELEGRAM FUNCTIONS =====================
-
-def send_telegram_photo(photo_buffer, symbol):
-    """Send PNG to Telegram"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    
-    timestamp = datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
-    
-    files = {
-        'photo': (f'{symbol}_{timestamp}.png', photo_buffer, 'image/png')
-    }
-    
-    data = {
-        'chat_id': TELEGRAM_CHAT_ID
-    }
-    
-    try:
-        response = requests.post(url, files=files, data=data, timeout=30)
-        response.raise_for_status()
-        print(f"✅ Sent {symbol} chart to Telegram")
-        return True
-    except Exception as e:
-        print(f"❌ Telegram Error ({symbol}): {e}")
-        return False
-
-
-# ===================== MAIN PROCESSING =====================
-
-def process_symbol(symbol):
-    """Process single symbol: fetch data + generate chart + send to Telegram"""
-    
-    print(f"\n{'='*50}")
-    print(f"🔄 Processing: {symbol}")
-    print(f"{'='*50}")
-    
-    try:
-        # Fetch candlestick data
-        candle_df = get_historical_candles(symbol)
-        if candle_df is None or candle_df.empty:
-            print(f"❌ No candle data for {symbol}")
-            return False
         
-        print(f"✅ Fetched {len(candle_df)} candles")
+        # Create table
+        table = ax2.table(
+            cellText=table_data,
+            loc='center',
+            cellLoc='center',
+            colWidths=[0.12] * 7
+        )
         
-        # Check if symbol has options (only indices)
-        if symbol in INDICES:
-            # Fetch option chain for indices
-            option_data = process_option_chain_data(symbol)
-            if option_data is None:
-                print(f"❌ No option chain data for {symbol}")
-                return False
-            
-            print(f"✅ Option chain processed - PCR OI: {option_data['pcr_oi']}")
-            
-            # Generate combined chart (candles + options)
-            chart_buffer = create_combined_chart(symbol, candle_df, option_data)
-            
-            # Send to Telegram
-            send_telegram_photo(chart_buffer, symbol)
-            
-        else:
-            # Stocks - only candlestick chart (no options)
-            print(f"📊 Stock - Candlestick only (no options)")
-            
-            # Create simple candlestick chart
-            chart_buffer = create_candlestick_only_chart(symbol, candle_df)
-            
-            # Send to Telegram
-            send_telegram_photo(chart_buffer, symbol)
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 2)
         
-        return True
+        # Style header
+        for i in range(7):
+            table[(0, i)].set_facecolor('#4a4a4a')
+            table[(0, i)].set_text_props(weight='bold', color='white')
         
-    except Exception as e:
-        print(f"❌ Error processing {symbol}: {e}")
-        return False
-
-
-def run_all_symbols():
-    """Process all symbols sequentially"""
-    
-    now = datetime.now(IST)
-    
-    # Check market hours (9:15 AM - 3:30 PM)
-    if not (9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 30)):
-        print(f"⏸️ Market closed - {now.strftime('%H:%M:%S')}")
-        return
-    
-    print(f"\n{'#'*60}")
-    print(f"🚀 Starting scan at {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'#'*60}")
-    
-    success_count = 0
-    
-    for symbol in ALL_SYMBOLS:
-        if process_symbol(symbol):
-            success_count += 1
+        # Style PCR row
+        pcr_row = len(table_data) - 1
+        for i in range(7):
+            table[(pcr_row, i)].set_facecolor('#ffd54f')
+            table[(pcr_row, i)].set_text_props(weight='bold')
         
-        time.sleep(2)  # Rate limiting
-    
-    print(f"\n{'='*60}")
-    print(f"✅ Completed: {success_count}/{len(ALL_SYMBOLS)} symbols")
-    print(f"{'='*60}\n")
+        # Highlight ATM strike
+        atm_strike = round(current_price / 50) * 50  # Adjust based on symbol
+        for i, strike in enumerate(analysis["strikes"], 1):
+            if strike == atm_strike:
+                for j in range(7):
+                    table[(i, j)].set_facecolor('#e3f2fd')
+        
+        plt.tight_layout()
+        
+        # Save to BytesIO
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=150, facecolor='white', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        return buf
 
-
-# ===================== SCHEDULER =====================
-
-def start_scheduler():
-    """Run every 5 minutes during market hours"""
+# ======================== TELEGRAM ALERTER ========================
+class TelegramAlerter:
+    def __init__(self, token: str, chat_id: str):
+        self.bot = Bot(token=token)
+        self.chat_id = chat_id
     
-    # Schedule every 5 minutes
-    schedule.every(5).minutes.do(run_all_symbols)
-    
-    print("🤖 Upstox Chart Bot Started!")
-    print("📊 Tracking: NIFTY, BANKNIFTY, MIDCPNIFTY, FINNIFTY + 50 stocks")
-    print("⏰ Running every 5 minutes (9:15 AM - 3:30 PM)\n")
-    
-    # Run immediately on start
-    run_all_symbols()
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+    async def send_chart(self, chart_buffer: BytesIO, symbol: str):
+        """Send chart image to Telegram"""
+        try:
+            caption = f"📊 {symbol} | {datetime.now(IST).strftime('%d-%b %H:%M')}"
+            
+            await self.bot.send_photo(
+                chat_id=self.chat_id,
+                photo=chart_buffer,
+                caption=caption
+            )
+            
+            logger.info(f"✅ Alert sent for {symbol}")
+            
+        except TelegramError as e:
+            logger.error(f"❌ Telegram error: {e}")
+        except Exception as e:
+            logger.error(f"❌ Error sending alert: {e}")
 
+# ======================== MAIN BOT ========================
+class UpstoxOptionsBot:
+    def __init__(self):
+        self.client = UpstoxClient(UPSTOX_ACCESS_TOKEN)
+        self.analyzer = OptionAnalyzer(self.client)
+        self.chart_gen = ChartGenerator()
+        self.alerter = TelegramAlerter(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    
+    def is_market_open(self) -> bool:
+        """Check if market is open"""
+        now = datetime.now(IST).time()
+        return MARKET_START <= now <= MARKET_END
+    
+    async def process_symbols(self):
+        """Process all symbols"""
+        if not self.is_market_open():
+            logger.info("⏸️ Market closed. Waiting...")
+            return
+        
+        logger.info("\n" + "="*60)
+        logger.info(f"🔍 ANALYSIS CYCLE - {datetime.now(IST).strftime('%H:%M:%S')}")
+        logger.info("="*60)
+        
+        # Priority: Indices first, then stocks
+        all_symbols = INDICES + NIFTY50_STOCKS
+        
+        for symbol in all_symbols:
+            try:
+                analysis = await self.analyzer.analyze_symbol(symbol)
+                
+                if analysis:
+                    # Generate chart
+                    chart = self.chart_gen.create_combined_chart(analysis)
+                    
+                    # Send to Telegram
+                    await self.alerter.send_chart(chart, symbol)
+                    
+                    logger.info(f"✅ {symbol} complete\n")
+                else:
+                    logger.warning(f"⚠️ {symbol} failed\n")
+                
+                # Delay between symbols
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing {symbol}: {e}\n")
+        
+        logger.info("="*60)
+        logger.info("✅ CYCLE COMPLETE")
+        logger.info("="*60 + "\n")
+    
+    async def run(self):
+        """Main bot loop"""
+        await self.client.create_session()
+        
+        logger.info("\n" + "="*60)
+        logger.info("🚀 UPSTOX OPTIONS BOT STARTED!")
+        logger.info("="*60)
+        logger.info(f"⏱️  Interval: {ANALYSIS_INTERVAL // 60} minutes")
+        logger.info(f"📊 Symbols: {len(INDICES)} indices + {len(NIFTY50_STOCKS)} stocks")
+        logger.info(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}")
+        logger.info(f"🎯 ATM Range: ±{ATM_RANGE} strikes")
+        logger.info("="*60 + "\n")
+        
+        try:
+            while True:
+                try:
+                    await self.process_symbols()
+                    
+                    next_run = datetime.now(IST) + timedelta(seconds=ANALYSIS_INTERVAL)
+                    logger.info(f"⏰ Next run: {next_run.strftime('%H:%M:%S')}\n")
+                    
+                    await asyncio.sleep(ANALYSIS_INTERVAL)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error in main loop: {e}")
+                    await asyncio.sleep(60)
+        
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Bot stopped by user")
+        
+        finally:
+            await self.client.close_session()
+            logger.info("👋 Session closed")
 
+# ======================== ENTRY POINT ========================
 if __name__ == "__main__":
-    start_scheduler()
+    bot = UpstoxOptionsBot()
+    asyncio.run(bot.run())
