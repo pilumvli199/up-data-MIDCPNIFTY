@@ -470,8 +470,12 @@ class UpstoxOptionsBot:
     
     async def process_symbols(self):
         """Process all symbols"""
+        now_time = datetime.now(IST)
+        
         if not self.is_market_open():
-            logger.info("⏸️ Market closed. Waiting...")
+            logger.info(f"⏸️ Market closed | Current time: {now_time.strftime('%H:%M:%S IST')}")
+            logger.info(f"   Market hours: {MARKET_START} - {MARKET_END}")
+            logger.info(f"   Next market open: Monday 09:15 AM\n")
             return
         
         logger.info("\n" + "="*60)
@@ -508,11 +512,31 @@ class UpstoxOptionsBot:
     
     async def run(self):
         """Main bot loop"""
+        # Check current market status
+        current_time = datetime.now(IST)
+        market_status = "🟢 OPEN" if self.is_market_open() else "🔴 CLOSED"
+        
+        # Flush startup message immediately
+        print("\n" + "="*60, flush=True)
+        print("🚀 UPSTOX OPTIONS BOT STARTED!", flush=True)
+        print("="*60, flush=True)
+        print(f"📅 Date: {current_time.strftime('%d-%b-%Y %A')}", flush=True)
+        print(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}", flush=True)
+        print(f"📊 Market Status: {market_status}", flush=True)
+        print(f"⏱️  Analysis Interval: {ANALYSIS_INTERVAL // 60} minutes", flush=True)
+        print(f"📊 Symbols: {len(INDICES)} indices + {len(NIFTY50_STOCKS)} stocks", flush=True)
+        print(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}", flush=True)
+        print(f"🎯 ATM Range: ±{ATM_RANGE} strikes", flush=True)
+        print("="*60 + "\n", flush=True)
+        
         await self.client.create_session()
         
         logger.info("\n" + "="*60)
         logger.info("🚀 UPSTOX OPTIONS BOT STARTED!")
         logger.info("="*60)
+        logger.info(f"📅 Date: {current_time.strftime('%d-%b-%Y %A')}")
+        logger.info(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}")
+        logger.info(f"📊 Market Status: {market_status}")
         logger.info(f"⏱️  Interval: {ANALYSIS_INTERVAL // 60} minutes")
         logger.info(f"📊 Symbols: {len(INDICES)} indices + {len(NIFTY50_STOCKS)} stocks")
         logger.info(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}")
