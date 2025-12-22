@@ -181,23 +181,33 @@ class UpstoxClient:
             logger.error(traceback.format_exc())
             return []
     
-    async def get_ltp(self, instrument_key: str) -> float:
-        """Get Last Traded Price"""
+    async def get_full_quote(self, instrument_key: str) -> Dict:
+        """Get Full Market Quote (LTP + OI + Volume)"""
         try:
-            url = f"{UPSTOX_API_URL}/market-quote/ltp"
+            url = f"{UPSTOX_API_URL}/market-quote/quotes"
             params = {"instrument_key": instrument_key}
             
             async with self.session.get(url, params=params) as response:
                 data = await response.json()
                 
                 if data.get("status") == "success" and data.get("data"):
+                    # Get first key (instrument data)
                     for key, value in data["data"].items():
-                        return value.get("last_price", 0.0)
+                        return {
+                            "ltp": value.get("last_price", 0.0),
+                            "volume": value.get("volume", 0),
+                            "oi": value.get("oi", 0)
+                        }
                 
-                return 0.0
+                return {"ltp": 0.0, "volume": 0, "oi": 0}
         except Exception as e:
-            logger.error(f"❌ Error fetching LTP: {e}")
-            return 0.0
+            logger.error(f"❌ Error fetching quote: {e}")
+            return {"ltp": 0.0, "volume": 0, "oi": 0}
+    
+    async def get_ltp(self, instrument_key: str) -> float:
+        """Get Last Traded Price (simple version)"""
+        quote = await self.get_full_quote(instrument_key)
+        return quote["ltp"]
     
     async def get_historical_candles(self, instrument_key: str, count: int = 50) -> pd.DataFrame:
         """Get historical intraday candles (5 min) using V3 API"""
@@ -319,17 +329,21 @@ class OptionAnalyzer:
         }
     
     async def fetch_option_prices(self, contracts_data: Dict):
-        """Fetch LTP for all option contracts"""
-        # Fetch CE prices
+        """Fetch Full Quote (LTP + OI + Volume) for all option contracts"""
+        # Fetch CE data
         for strike, contract in contracts_data["ce"].items():
-            ltp = await self.client.get_ltp(contract["instrument_key"])
-            contract["ltp"] = ltp
+            quote = await self.client.get_full_quote(contract["instrument_key"])
+            contract["ltp"] = quote["ltp"]
+            contract["oi"] = quote["oi"]
+            contract["volume"] = quote["volume"]
             await asyncio.sleep(0.05)  # Rate limiting
         
-        # Fetch PE prices
+        # Fetch PE data
         for strike, contract in contracts_data["pe"].items():
-            ltp = await self.client.get_ltp(contract["instrument_key"])
-            contract["ltp"] = ltp
+            quote = await self.client.get_full_quote(contract["instrument_key"])
+            contract["ltp"] = quote["ltp"]
+            contract["oi"] = quote["oi"]
+            contract["volume"] = quote["volume"]
             await asyncio.sleep(0.05)  # Rate limiting
     
     async def analyze_symbol(self, symbol: str) -> Optional[Dict]:
@@ -406,26 +420,32 @@ class OptionAnalyzer:
             
             logger.info(f"   📊 CE count: {len(ce_data)}, PE count: {len(pe_data)}")
             
-            # Log per-strike data
+            # Log per-strike data with OI and Volume
             logger.info("")
-            logger.info("📊 PER-STRIKE PREMIUM PRICES:")
-            logger.info("━" * 60)
-            logger.info(f"{'Strike':>8} | {'CE LTP':>10} | {'PE LTP':>10}")
-            logger.info("━" * 60)
+            logger.info("📊 PER-STRIKE BREAKDOWN:")
+            logger.info("━" * 80)
+            logger.info(f"{'Strike':>8} | {'CE OI':>12} | {'CE Vol':>10} | {'CE LTP':>10} | {'PE LTP':>10} | {'PE Vol':>10} | {'PE OI':>12}")
+            logger.info("━" * 80)
+            
+            atm_strike = round(current_price / self.get_strike_interval(symbol)) * self.get_strike_interval(symbol)
             
             for strike in contracts_data["strikes"]:
-                ce = contracts_data["ce"].get(strike, {"ltp": 0})
-                pe = contracts_data["pe"].get(strike, {"ltp": 0})
+                ce = contracts_data["ce"].get(strike, {"ltp": 0, "oi": 0, "volume": 0})
+                pe = contracts_data["pe"].get(strike, {"ltp": 0, "oi": 0, "volume": 0})
                 
-                marker = " ATM" if strike == round(current_price / self.get_strike_interval(symbol)) * self.get_strike_interval(symbol) else ""
+                marker = " ATM" if strike == atm_strike else ""
                 
                 logger.info(
                     f"{int(strike):>8}{marker:4} | "
+                    f"{ce['oi']:>12,} | "
+                    f"{ce['volume']:>10,} | "
                     f"₹{ce['ltp']:>9.2f} | "
-                    f"₹{pe['ltp']:>9.2f}"
+                    f"₹{pe['ltp']:>9.2f} | "
+                    f"{pe['volume']:>10,} | "
+                    f"{pe['oi']:>12,}"
                 )
             
-            logger.info("━" * 60)
+            logger.info("━" * 80)
             logger.info("")
             
             return {
@@ -508,24 +528,25 @@ class ChartGenerator:
             
             row = [
                 f"₹{strike:,.0f}",
-                "N/A",  # OI not available
-                "N/A",  # Volume not available
+                f"{ce['oi']:,}",
+                f"{ce['volume']:,}",
                 f"₹{ce['ltp']:.2f}",
                 f"₹{pe['ltp']:.2f}",
-                "N/A",
-                "N/A"
+                f"{pe['volume']:,}",
+                f"{pe['oi']:,}"
             ]
             table_data.append(row)
         
-        # Add info row
+        # Add PCR row
+        pcr_oi = analysis.get("pcr_oi", 0)
         table_data.append([
-            "Note",
+            "PCR",
             "",
             "",
-            "Premium prices only",
-            "OI data needs",
+            f"OI: {pcr_oi:.3f}",
+            f"Vol: N/A",
             "",
-            "Full Quote API"
+            ""
         ])
         
         # Create table
@@ -545,11 +566,11 @@ class ChartGenerator:
             table[(0, i)].set_facecolor('#4a4a4a')
             table[(0, i)].set_text_props(weight='bold', color='white')
         
-        # Style info row
-        info_row = len(table_data) - 1
+        # Style PCR row
+        pcr_row = len(table_data) - 1
         for i in range(7):
-            table[(info_row, i)].set_facecolor('#fff3cd')
-            table[(info_row, i)].set_text_props(style='italic', fontsize=8)
+            table[(pcr_row, i)].set_facecolor('#ffd54f')
+            table[(pcr_row, i)].set_text_props(weight='bold')
         
         # Highlight ATM strike
         interval = 50 if symbol == "NIFTY" else 100
@@ -578,15 +599,22 @@ class TelegramAlerter:
     async def send_chart(self, chart_buffer: BytesIO, symbol: str, analysis: Dict):
         """Send chart image to Telegram"""
         try:
+            total_ce_oi = sum(d["oi"] for d in analysis["ce_data"])
+            total_pe_oi = sum(d["oi"] for d in analysis["pe_data"])
+            pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            
             caption = f"""📊 {symbol} Option Chain
 💰 Spot: ₹{analysis['current_price']:,.2f}
 📅 Expiry: {analysis['expiry']}
 🎯 Strikes: {len(analysis['strikes'])} (ATM ±{ATM_RANGE})
 
+📈 Total CE OI: {total_ce_oi:,.0f}
+📉 Total PE OI: {total_pe_oi:,.0f}
+🔄 PCR: {pcr:.3f}
+
 ⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
 
-✅ Premium prices fetched
-⚠️ OI data needs Full Quote API upgrade"""
+✅ Full data: LTP + OI + Volume"""
             
             await self.bot.send_photo(
                 chat_id=self.chat_id,
