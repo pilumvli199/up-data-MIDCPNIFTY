@@ -439,7 +439,7 @@ class ConfluenceAnalyzer:
         
         return signal
 
-# ======================== UPSTOX CLIENT (Enhanced) ========================
+# ======================== UPSTOX CLIENT (FIXED) ========================
 class UpstoxClient:
     def __init__(self, access_token: str):
         self.access_token = access_token
@@ -576,51 +576,77 @@ class UpstoxClient:
         return quote["ltp"]
     
     async def get_historical_candles_combined(self, instrument_key: str) -> pd.DataFrame:
-        """Get 200+ candles by combining historical + intraday"""
+        """FIXED: Get 200+ candles using proper V3 API endpoints"""
         try:
             all_candles = []
+            now = datetime.now(IST)
             
-            # 1. Get historical daily candles (last 30 days)
-            url_daily = f"{UPSTOX_API_URL}/historical-candle/{instrument_key}/day/2023-01-01/2025-12-31"
-            
-            async with self.session.get(url_daily) as response:
-                data = await response.json()
-                
-                if data.get("status") == "success" and data.get("data", {}).get("candles"):
-                    daily_candles = data["data"]["candles"][-30:]  # Last 30 days
-                    
-                    for candle in daily_candles:
-                        all_candles.append({
-                            'timestamp': pd.to_datetime(candle[0]),
-                            'open': candle[1],
-                            'high': candle[2],
-                            'low': candle[3],
-                            'close': candle[4],
-                            'volume': candle[5],
-                            'oi': candle[6] if len(candle) > 6 else 0
-                        })
-            
-            # 2. Get intraday 5min candles (today)
-            url_intraday = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/5/minute"
+            # ✅ FIXED: Use V3 Intraday API for today's 5-minute candles
+            logger.info("📊 Fetching intraday 5-min candles (V3 API)...")
+            url_intraday = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/minutes/5"
             
             async with self.session.get(url_intraday) as response:
-                data = await response.json()
+                response_text = await response.text()
+                logger.info(f"Intraday response status: {response.status}")
                 
-                if data.get("status") == "success" and data.get("data", {}).get("candles"):
-                    intraday_candles = data["data"]["candles"][:100]
+                if response.status == 200:
+                    data = json.loads(response_text)
                     
-                    for candle in intraday_candles:
-                        all_candles.append({
-                            'timestamp': pd.to_datetime(candle[0]),
-                            'open': candle[1],
-                            'high': candle[2],
-                            'low': candle[3],
-                            'close': candle[4],
-                            'volume': candle[5],
-                            'oi': candle[6] if len(candle) > 6 else 0
-                        })
+                    if data.get("status") == "success" and data.get("data", {}).get("candles"):
+                        intraday_candles = data["data"]["candles"]
+                        logger.info(f"✅ Got {len(intraday_candles)} intraday candles")
+                        
+                        for candle in intraday_candles:
+                            all_candles.append({
+                                'timestamp': pd.to_datetime(candle[0]),
+                                'open': candle[1],
+                                'high': candle[2],
+                                'low': candle[3],
+                                'close': candle[4],
+                                'volume': candle[5],
+                                'oi': candle[6] if len(candle) > 6 else 0
+                            })
+                    else:
+                        logger.warning(f"⚠️ No intraday candles in response")
+                else:
+                    logger.error(f"❌ Intraday API failed: {response.status} - {response_text[:200]}")
+            
+            # ✅ FIXED: Use V3 Historical API for past days (5-minute data from last 30 days)
+            logger.info("📊 Fetching historical 5-min candles (V3 API)...")
+            
+            to_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+            from_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            
+            url_historical = f"{UPSTOX_API_V3_URL}/historical-candle/{instrument_key}/minutes/5/{to_date}/{from_date}"
+            
+            async with self.session.get(url_historical) as response:
+                response_text = await response.text()
+                logger.info(f"Historical response status: {response.status}")
+                
+                if response.status == 200:
+                    data = json.loads(response_text)
+                    
+                    if data.get("status") == "success" and data.get("data", {}).get("candles"):
+                        historical_candles = data["data"]["candles"]
+                        logger.info(f"✅ Got {len(historical_candles)} historical candles")
+                        
+                        for candle in historical_candles:
+                            all_candles.append({
+                                'timestamp': pd.to_datetime(candle[0]),
+                                'open': candle[1],
+                                'high': candle[2],
+                                'low': candle[3],
+                                'close': candle[4],
+                                'volume': candle[5],
+                                'oi': candle[6] if len(candle) > 6 else 0
+                            })
+                    else:
+                        logger.warning(f"⚠️ No historical candles in response")
+                else:
+                    logger.error(f"❌ Historical API failed: {response.status} - {response_text[:200]}")
             
             if not all_candles:
+                logger.error("❌ No candles fetched from any source")
                 return pd.DataFrame()
             
             df = pd.DataFrame(all_candles)
@@ -628,12 +654,14 @@ class UpstoxClient:
             df = df.sort_index()
             df = df[~df.index.duplicated(keep='last')]
             
-            logger.info(f"✅ Combined {len(df)} candles (Historical + Intraday)")
+            logger.info(f"✅ Combined {len(df)} total candles")
             
             return df
             
         except Exception as e:
             logger.error(f"❌ Error fetching candles: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
     
     async def get_futures_volume_map(self, candles_df: pd.DataFrame) -> Dict:
@@ -644,7 +672,8 @@ class UpstoxClient:
             return volume_map
         
         try:
-            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{self.futures_key}/5/minute"
+            # ✅ FIXED: Use V3 API for futures intraday
+            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{self.futures_key}/minutes/5"
             
             async with self.session.get(url) as response:
                 data = await response.json()
@@ -1167,7 +1196,7 @@ class TelegramAlerter:
 
 ⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
 
-✅ Priority #1, #3, #7 Implemented"""
+✅ V3 API | Pattern-Strike-PCR Confluence"""
             
             await self.bot.send_photo(
                 chat_id=self.chat_id,
@@ -1231,16 +1260,16 @@ class UpstoxOptionsBot:
         market_status = "🟢 OPEN" if self.is_market_open() else "🔴 CLOSED"
         
         print("\n" + "="*70)
-        print("🚀 ENHANCED UPSTOX BOT - FINAL VERSION v4.0", flush=True)
+        print("🚀 FIXED UPSTOX BOT - V3 API VERSION", flush=True)
         print("="*70)
         print(f"📅 {current_time.strftime('%d-%b-%Y %A')}", flush=True)
         print(f"🕐 {current_time.strftime('%H:%M:%S IST')}", flush=True)
         print(f"📊 Market: {market_status}", flush=True)
         print(f"⏱️  Interval: 5 minutes", flush=True)
-        print(f"✅ #1: Pattern-Strike Link", flush=True)
-        print(f"✅ #3: Confluence Analysis", flush=True)
-        print(f"✅ #7: Trade Signals (Entry/SL/Target)", flush=True)
-        print(f"📈 200+ Candles | Futures Volume | Chart: 24x16", flush=True)
+        print(f"✅ Using V3 API for 5-min candles", flush=True)
+        print(f"✅ Pattern-Strike-PCR Confluence", flush=True)
+        print(f"✅ Trade Signals (Entry/SL/Target)", flush=True)
+        print(f"📈 200+ Candles | Chart: 24x16", flush=True)
         print("="*70 + "\n", flush=True)
         
         await self.client.create_session()
