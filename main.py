@@ -408,9 +408,30 @@ class OptionAnalyzer:
             # Fetch prices for all strikes
             await self.fetch_option_prices(contracts_data)
             
-            # Calculate PCR (OI data not available in LTP endpoint, will be 0)
-            ce_data = [contracts_data["ce"].get(s, {"strike": s, "ltp": 0, "oi": 0, "volume": 0}) for s in contracts_data["strikes"]]
-            pe_data = [contracts_data["pe"].get(s, {"strike": s, "ltp": 0, "oi": 0, "volume": 0}) for s in contracts_data["strikes"]]
+            # Calculate per-strike PCR and add to data
+            for strike in contracts_data["strikes"]:
+                ce = contracts_data["ce"].get(strike)
+                pe = contracts_data["pe"].get(strike)
+                
+                if ce and pe:
+                    # Calculate per-strike PCR
+                    strike_pcr = pe["oi"] / ce["oi"] if ce["oi"] > 0 else 0
+                    ce["pcr"] = strike_pcr
+                    pe["pcr"] = strike_pcr
+            
+            # Prepare data with PCR
+            ce_data = []
+            pe_data = []
+            
+            for s in contracts_data["strikes"]:
+                ce = contracts_data["ce"].get(s, {
+                    "strike": s, "ltp": 0, "oi": 0, "volume": 0, "pcr": 0
+                })
+                pe = contracts_data["pe"].get(s, {
+                    "strike": s, "ltp": 0, "oi": 0, "volume": 0, "pcr": 0
+                })
+                ce_data.append(ce)
+                pe_data.append(pe)
             
             total_ce_oi = sum(d["oi"] for d in ce_data)
             total_pe_oi = sum(d["oi"] for d in pe_data)
@@ -420,32 +441,82 @@ class OptionAnalyzer:
             
             logger.info(f"   📊 CE count: {len(ce_data)}, PE count: {len(pe_data)}")
             
-            # Log per-strike data with OI and Volume
+            # Log per-strike data with PCR
             logger.info("")
-            logger.info("📊 PER-STRIKE BREAKDOWN:")
-            logger.info("━" * 80)
-            logger.info(f"{'Strike':>8} | {'CE OI':>12} | {'CE Vol':>10} | {'CE LTP':>10} | {'PE LTP':>10} | {'PE Vol':>10} | {'PE OI':>12}")
-            logger.info("━" * 80)
+            logger.info("📊 PER-STRIKE ANALYSIS:")
+            logger.info("━" * 95)
+            logger.info(f"{'Strike':>8} | {'Put OI':>12} | {'Call OI':>12} | {'PCR':>6} | {'Signal':>20} | {'Action':>25}")
+            logger.info("━" * 95)
             
             atm_strike = round(current_price / self.get_strike_interval(symbol)) * self.get_strike_interval(symbol)
             
             for strike in contracts_data["strikes"]:
-                ce = contracts_data["ce"].get(strike, {"ltp": 0, "oi": 0, "volume": 0})
-                pe = contracts_data["pe"].get(strike, {"ltp": 0, "oi": 0, "volume": 0})
+                ce = contracts_data["ce"].get(strike, {"oi": 0, "pcr": 0})
+                pe = contracts_data["pe"].get(strike, {"oi": 0, "pcr": 0})
+                
+                pcr = pe["pcr"]
+                
+                # Determine signal and action
+                if pcr > 2.5:
+                    signal = "🟢🟢 STRONG SUPPORT"
+                    action = "Good buying zone"
+                elif pcr > 1.5:
+                    signal = "🟢 Support"
+                    action = "Bullish bias"
+                elif pcr > 1.1:
+                    signal = "⚪ Neutral-High"
+                    action = "Slight bullish"
+                elif pcr >= 0.9:
+                    signal = "⚪ Balanced"
+                    action = "Wait & watch"
+                elif pcr >= 0.5:
+                    signal = "🔴 Resistance"
+                    action = "Bearish zone"
+                elif pcr >= 0.3:
+                    signal = "🔴🔴 STRONG RESIST"
+                    action = "Selling pressure"
+                else:
+                    signal = "🔴🔴🔴 EXTREME"
+                    action = "Major barrier"
                 
                 marker = " ATM" if strike == atm_strike else ""
                 
                 logger.info(
                     f"{int(strike):>8}{marker:4} | "
+                    f"{pe['oi']:>12,} | "
                     f"{ce['oi']:>12,} | "
-                    f"{ce['volume']:>10,} | "
-                    f"₹{ce['ltp']:>9.2f} | "
-                    f"₹{pe['ltp']:>9.2f} | "
-                    f"{pe['volume']:>10,} | "
-                    f"{pe['oi']:>12,}"
+                    f"{pcr:>6.2f} | "
+                    f"{signal:>20} | "
+                    f"{action:>25}"
                 )
             
-            logger.info("━" * 80)
+            logger.info("━" * 95)
+            
+            # Overall market interpretation
+            total_ce_oi = sum(d["oi"] for d in ce_data)
+            total_pe_oi = sum(d["oi"] for d in pe_data)
+            overall_pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            
+            logger.info("")
+            logger.info("📈 MARKET INTERPRETATION:")
+            logger.info(f"   Overall PCR: {overall_pcr:.3f}")
+            
+            if overall_pcr > 1.5:
+                logger.info(f"   Signal: 🟢 BULLISH - Strong put writing indicates support")
+                logger.info(f"   Action: Look for buying opportunities on dips")
+            elif overall_pcr > 1.1:
+                logger.info(f"   Signal: 🟢 SLIGHTLY BULLISH - More put OI than call OI")
+                logger.info(f"   Action: Moderate bullish stance")
+            elif overall_pcr >= 0.9:
+                logger.info(f"   Signal: ⚪ NEUTRAL - Balanced put-call ratio")
+                logger.info(f"   Action: Wait for clear direction")
+            elif overall_pcr >= 0.7:
+                logger.info(f"   Signal: 🔴 SLIGHTLY BEARISH - More call OI than put OI")
+                logger.info(f"   Action: Cautious approach")
+            else:
+                logger.info(f"   Signal: 🔴 BEARISH - Heavy call writing indicates resistance")
+                logger.info(f"   Action: Look for selling opportunities on rallies")
+            
             logger.info("")
             
             return {
@@ -519,65 +590,104 @@ class ChartGenerator:
         ax2.axis('tight')
         ax2.axis('off')
         
-        # Prepare table data
-        table_data = [["Strike", "CE OI", "CE Vol", "CE LTP", "PE LTP", "PE Vol", "PE OI"]]
+        # Prepare table data with PCR column
+        table_data = [["Strike", "Put OI", "Call OI", "PCR", "CE LTP", "PE LTP", "Signal", "Action"]]
+        
+        interval = 50 if symbol == "NIFTY" else (100 if symbol == "BANKNIFTY" else 50)
+        atm_strike = round(current_price / interval) * interval
         
         for i, strike in enumerate(analysis["strikes"]):
             ce = analysis["ce_data"][i]
             pe = analysis["pe_data"][i]
             
+            pcr = pe.get("pcr", 0)
+            
+            # Determine signal
+            if pcr > 2.5:
+                signal = "🟢🟢 STRONG SUPPORT"
+                action = "Buy zone"
+            elif pcr > 1.5:
+                signal = "🟢 Support"
+                action = "Bullish"
+            elif pcr > 1.1:
+                signal = "⚪ Neutral+"
+                action = "Slight bull"
+            elif pcr >= 0.9:
+                signal = "⚪ Balanced"
+                action = "Watch"
+            elif pcr >= 0.5:
+                signal = "🔴 Resistance"
+                action = "Bearish"
+            else:
+                signal = "🔴🔴 STRONG"
+                action = "Sell zone"
+            
             row = [
-                f"₹{strike:,.0f}",
+                f"₹{strike:,.0f}{'*' if strike == atm_strike else ''}",
+                f"{pe['oi']:,}",
                 f"{ce['oi']:,}",
-                f"{ce['volume']:,}",
+                f"{pcr:.2f}",
                 f"₹{ce['ltp']:.2f}",
                 f"₹{pe['ltp']:.2f}",
-                f"{pe['volume']:,}",
-                f"{pe['oi']:,}"
+                signal,
+                action
             ]
             table_data.append(row)
         
-        # Add PCR row
-        pcr_oi = analysis.get("pcr_oi", 0)
+        # Add summary row
+        total_ce_oi = sum(d["oi"] for d in analysis["ce_data"])
+        total_pe_oi = sum(d["oi"] for d in analysis["pe_data"])
+        overall_pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+        
+        if overall_pcr > 1.5:
+            market_signal = "🟢 BULLISH"
+        elif overall_pcr > 1.1:
+            market_signal = "🟢 Slight Bull"
+        elif overall_pcr >= 0.9:
+            market_signal = "⚪ NEUTRAL"
+        elif overall_pcr >= 0.7:
+            market_signal = "🔴 Slight Bear"
+        else:
+            market_signal = "🔴 BEARISH"
+        
         table_data.append([
-            "PCR",
+            "OVERALL",
+            f"{total_pe_oi:,.0f}",
+            f"{total_ce_oi:,.0f}",
+            f"{overall_pcr:.2f}",
             "",
             "",
-            f"OI: {pcr_oi:.3f}",
-            f"Vol: N/A",
-            "",
-            ""
+            market_signal,
+            "See above"
         ])
         
-        # Create table
+        # Create table with adjusted column widths
         table = ax2.table(
             cellText=table_data,
             loc='center',
             cellLoc='center',
-            colWidths=[0.12] * 7
+            colWidths=[0.10, 0.12, 0.12, 0.08, 0.10, 0.10, 0.16, 0.12]
         )
         
         table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 2)
+        table.set_fontsize(8)
+        table.scale(1, 2.2)
         
         # Style header
-        for i in range(7):
+        for i in range(8):
             table[(0, i)].set_facecolor('#4a4a4a')
             table[(0, i)].set_text_props(weight='bold', color='white')
         
-        # Style PCR row
-        pcr_row = len(table_data) - 1
-        for i in range(7):
-            table[(pcr_row, i)].set_facecolor('#ffd54f')
-            table[(pcr_row, i)].set_text_props(weight='bold')
+        # Style summary row
+        summary_row = len(table_data) - 1
+        for i in range(8):
+            table[(summary_row, i)].set_facecolor('#ffd54f')
+            table[(summary_row, i)].set_text_props(weight='bold')
         
         # Highlight ATM strike
-        interval = 50 if symbol == "NIFTY" else 100
-        atm_strike = round(current_price / interval) * interval
         for i, strike in enumerate(analysis["strikes"], 1):
             if strike == atm_strike:
-                for j in range(7):
+                for j in range(8):
                     table[(i, j)].set_facecolor('#e3f2fd')
         
         plt.tight_layout()
@@ -597,24 +707,54 @@ class TelegramAlerter:
         self.chat_id = chat_id
     
     async def send_chart(self, chart_buffer: BytesIO, symbol: str, analysis: Dict):
-        """Send chart image to Telegram"""
+        """Send chart image to Telegram with detailed analysis"""
         try:
             total_ce_oi = sum(d["oi"] for d in analysis["ce_data"])
             total_pe_oi = sum(d["oi"] for d in analysis["pe_data"])
             pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
             
-            caption = f"""📊 {symbol} Option Chain
+            # Determine market bias
+            if pcr > 1.5:
+                bias = "🟢 BULLISH"
+                action = "Look for buying opportunities"
+            elif pcr > 1.1:
+                bias = "🟢 Slightly Bullish"
+                action = "Moderate bullish stance"
+            elif pcr >= 0.9:
+                bias = "⚪ NEUTRAL"
+                action = "Wait for clear direction"
+            elif pcr >= 0.7:
+                bias = "🔴 Slightly Bearish"
+                action = "Cautious approach"
+            else:
+                bias = "🔴 BEARISH"
+                action = "Look for selling opportunities"
+            
+            # Find support/resistance levels
+            strikes_sorted = sorted(analysis["ce_data"], key=lambda x: x.get("pcr", 0), reverse=True)
+            support_strike = strikes_sorted[0]["strike"] if strikes_sorted else 0
+            
+            strikes_sorted_resist = sorted(analysis["ce_data"], key=lambda x: x.get("pcr", 0))
+            resistance_strike = strikes_sorted_resist[0]["strike"] if strikes_sorted_resist else 0
+            
+            caption = f"""📊 {symbol} Option Chain Analysis
+
 💰 Spot: ₹{analysis['current_price']:,.2f}
 📅 Expiry: {analysis['expiry']}
-🎯 Strikes: {len(analysis['strikes'])} (ATM ±{ATM_RANGE})
 
 📈 Total CE OI: {total_ce_oi:,.0f}
 📉 Total PE OI: {total_pe_oi:,.0f}
-🔄 PCR: {pcr:.3f}
+🔄 Overall PCR: {pcr:.3f}
+
+{bias}
+💡 {action}
+
+🟢 Strong Support: ₹{support_strike:,.0f}
+🔴 Strong Resistance: ₹{resistance_strike:,.0f}
 
 ⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
 
-✅ Full data: LTP + OI + Volume"""
+✅ Full Analysis: PCR + OI + Action"""
             
             await self.bot.send_photo(
                 chat_id=self.chat_id,
