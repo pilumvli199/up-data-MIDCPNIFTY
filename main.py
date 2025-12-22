@@ -12,7 +12,6 @@ from telegram.error import TelegramError
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
-import mplfinance as mpf
 from io import BytesIO
 import pytz
 
@@ -941,89 +940,123 @@ class OptionAnalyzer:
 class ChartGenerator:
     @staticmethod
     def create_combined_chart(analysis: Dict) -> BytesIO:
-        """24x16 chart with 4 sections"""
+        """24x16 chart with TradingView professional styling"""
         symbol = analysis["symbol"]
-        candles = analysis["candles"].tail(50)  # Show last 50 on chart
+        candles = analysis["candles"].tail(50)
         current_price = analysis["current_price"]
         patterns = analysis.get("patterns", [])
         sr_levels = analysis.get("sr_levels", {"support": [], "resistance": []})
         high_prob_setups = analysis.get("high_probability_setups", [])
         
+        # Reset index for plotting
+        candles_plot = candles.reset_index()
+        
         # ✅ 24x16 inches, DPI 220
-        fig = plt.figure(figsize=(24, 16), facecolor='white', dpi=220)
+        fig = plt.figure(figsize=(24, 16), facecolor='#f8f9fa', dpi=220)
         gs = GridSpec(4, 1, height_ratios=[3, 0.8, 0.8, 1.2], hspace=0.35)
         
-        # ========== 1. CANDLESTICK CHART ==========
+        # ========== 1. TRADINGVIEW STYLE CANDLESTICK CHART ==========
         ax1 = fig.add_subplot(gs[0])
+        ax1.set_facecolor('#ffffff')
         
-        mc = mpf.make_marketcolors(
-            up='#26a69a', down='#ef5350',
-            edge='inherit',
-            wick={'up': '#26a69a', 'down': '#ef5350'},
-            volume='in',
-            alpha=0.9
-        )
+        # Draw candlesticks manually for TradingView look
+        for idx, row in candles_plot.iterrows():
+            open_price = row['open']
+            high_price = row['high']
+            low_price = row['low']
+            close_price = row['close']
+            
+            # Determine color
+            if close_price >= open_price:
+                color = '#26a69a'  # Green (bullish)
+                edge_color = '#26a69a'
+            else:
+                color = '#ef5350'  # Red (bearish)
+                edge_color = '#ef5350'
+            
+            # Draw high-low line (wick)
+            ax1.plot([idx, idx], [low_price, high_price], 
+                    color=edge_color, linewidth=1.5, solid_capstyle='round', zorder=1)
+            
+            # Draw open-close box (body)
+            height = abs(close_price - open_price)
+            bottom = min(open_price, close_price)
+            
+            if height < 1:  # Doji-like candle
+                height = 1
+            
+            rect = mpatches.Rectangle(
+                (idx - 0.4, bottom), 0.8, height,
+                linewidth=0,
+                edgecolor=edge_color,
+                facecolor=color,
+                alpha=0.95,
+                zorder=2
+            )
+            ax1.add_patch(rect)
         
-        s = mpf.make_mpf_style(
-            marketcolors=mc,
-            gridstyle='--',
-            gridcolor='#e0e0e0',
-            facecolor='white',
-            figcolor='white',
-            y_on_right=False
-        )
+        # Styling - TradingView grid
+        ax1.grid(True, which='both', linestyle='-', linewidth=0.6, color='#e1e3e6', alpha=0.7, zorder=0)
+        ax1.set_axisbelow(True)
         
-        mpf.plot(
-            candles,
-            type='candle',
-            style=s,
-            ax=ax1,
-            volume=False,
-            show_nontrading=False
-        )
+        # Set x-axis with time labels
+        time_labels = [t.strftime('%H:%M') if isinstance(t, pd.Timestamp) else '' 
+                      for t in candles_plot['timestamp']]
+        ax1.set_xticks(range(0, len(candles_plot), max(1, len(candles_plot)//10)))
+        ax1.set_xticklabels([time_labels[i] for i in range(0, len(candles_plot), max(1, len(candles_plot)//10))],
+                           fontsize=11, color='#4a4a4a', fontweight='500')
         
-        # Draw S/R
+        # Y-axis styling
+        ax1.tick_params(axis='y', labelsize=11, colors='#4a4a4a')
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.spines['left'].set_color('#e1e3e6')
+        ax1.spines['bottom'].set_color('#e1e3e6')
+        
+        # Draw Support levels (TradingView style)
         for support in sr_levels['support']:
-            ax1.axhline(y=support, color='green', linestyle='--', linewidth=2.5, alpha=0.7)
-            ax1.text(0.01, support, f'  🟢 Support ₹{support:.0f}', 
-                    transform=ax1.get_yaxis_transform(), 
-                    color='white', fontsize=11, fontweight='bold', va='center',
-                    bbox=dict(boxstyle='round,pad=0.6', facecolor='green', alpha=0.9))
+            ax1.axhline(y=support, color='#26a69a', linestyle='--', linewidth=2.5, alpha=0.8, zorder=3)
+            ax1.text(2, support, f'  🟢 Support ₹{support:.0f}', 
+                    fontsize=12, fontweight='bold', color='white',
+                    bbox=dict(boxstyle='round,pad=0.7', facecolor='#26a69a', 
+                             edgecolor='#1e8e7e', linewidth=2, alpha=0.95),
+                    verticalalignment='center', zorder=4)
         
+        # Draw Resistance levels (TradingView style)
         for resistance in sr_levels['resistance']:
-            ax1.axhline(y=resistance, color='red', linestyle='--', linewidth=2.5, alpha=0.7)
-            ax1.text(0.01, resistance, f'  🔴 Resistance ₹{resistance:.0f}', 
-                    transform=ax1.get_yaxis_transform(), 
-                    color='white', fontsize=11, fontweight='bold', va='center',
-                    bbox=dict(boxstyle='round,pad=0.6', facecolor='red', alpha=0.9))
+            ax1.axhline(y=resistance, color='#ef5350', linestyle='--', linewidth=2.5, alpha=0.8, zorder=3)
+            ax1.text(2, resistance, f'  🔴 Resistance ₹{resistance:.0f}', 
+                    fontsize=12, fontweight='bold', color='white',
+                    bbox=dict(boxstyle='round,pad=0.7', facecolor='#ef5350', 
+                             edgecolor='#d32f2f', linewidth=2, alpha=0.95),
+                    verticalalignment='center', zorder=4)
         
-        # Mark patterns
+        # Mark candlestick patterns with bigger markers
         for pattern in patterns[-8:]:
             idx = pattern['index']
-            if idx >= len(candles):
+            if idx >= len(candles_plot):
                 continue
             
-            candle_time = candles.index[min(idx, len(candles)-1)]
-            candle_high = candles.iloc[min(idx, len(candles)-1)]['high']
+            candle_high = candles_plot.iloc[min(idx, len(candles_plot)-1)]['high']
             
-            color = 'green' if pattern['type'] == 'bullish' else ('red' if pattern['type'] == 'bearish' else 'blue')
+            color = '#26a69a' if pattern['type'] == 'bullish' else ('#ef5350' if pattern['type'] == 'bearish' else '#2196f3')
             marker = '▲' if pattern['type'] == 'bullish' else ('▼' if pattern['type'] == 'bearish' else '●')
             
-            ax1.annotate(
-                f"{marker}", 
-                xy=(candle_time, candle_high),
-                xytext=(0, 25),
-                textcoords='offset points',
-                fontsize=16,
-                fontweight='bold',
-                color=color,
-                bbox=dict(boxstyle='circle', facecolor='white', edgecolor=color, linewidth=2),
-                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0.3', color=color, linewidth=2)
-            )
+            # Draw pattern marker
+            ax1.plot(idx, candle_high + (candles_plot['high'].max() - candles_plot['low'].min()) * 0.02,
+                    marker=marker, markersize=18, color=color, zorder=5,
+                    markeredgecolor='white', markeredgewidth=1.5)
         
-        ax1.set_title(f"{symbol} - 5min Chart (Last 50 of 200+ candles) | Spot: ₹{current_price:,.2f} | Expiry: {analysis['expiry']}", 
-                     fontsize=18, fontweight='bold', pad=20)
-        ax1.grid(True, alpha=0.3, linewidth=0.8)
+        # Title (TradingView style)
+        title_text = f"{symbol} • 5min • Last 50 of 200+ candles"
+        subtitle_text = f"Spot: ₹{current_price:,.2f} • Expiry: {analysis['expiry']}"
+        
+        ax1.text(0.01, 1.05, title_text, transform=ax1.transAxes,
+                fontsize=18, fontweight='bold', color='#2c3e50', 
+                verticalalignment='bottom')
+        ax1.text(0.01, 1.01, subtitle_text, transform=ax1.transAxes,
+                fontsize=13, fontweight='500', color='#7f8c8d',
+                verticalalignment='bottom')
         
         # ========== 2. HIGH PROBABILITY SETUPS ==========
         ax_setups = fig.add_subplot(gs[1])
