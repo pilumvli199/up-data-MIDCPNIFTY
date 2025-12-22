@@ -74,10 +74,7 @@ class UpstoxClient:
     
     def get_instrument_key(self, symbol: str, segment: str = "NSE_INDEX") -> str:
         """Get Upstox instrument key"""
-        # For indices: NSE_INDEX|Nifty 50
-        # For stocks: NSE_EQ|INE002A01018 (ISIN)
-        # For options: NFO|NIFTY24DEC19C24000
-        
+        # Index mapping (verified from Upstox docs)
         if symbol in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY"]:
             mapping = {
                 "NIFTY": "NSE_INDEX|Nifty 50",
@@ -85,9 +82,11 @@ class UpstoxClient:
                 "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
                 "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
             }
-            return mapping.get(symbol, f"NSE_INDEX|{symbol}")
+            return mapping.get(symbol)
         else:
-            # Stock - use NSE_EQ segment with symbol
+            # For stocks - Upstox needs ISIN codes
+            # For now, using symbol directly (will get error but shows format)
+            # TODO: Add ISIN mapping
             return f"NSE_EQ|{symbol}"
     
     async def get_ltp(self, instrument_key: str) -> float:
@@ -99,8 +98,13 @@ class UpstoxClient:
             async with self.session.get(url, params=params) as response:
                 data = await response.json()
                 
-                if data.get("status") == "success":
-                    return data["data"][instrument_key]["last_price"]
+                if data.get("status") == "success" and data.get("data"):
+                    # Response format: {"status": "success", "data": {"NSE_EQ:NHPC": {"last_price": 52.05}}}
+                    # Get first (and only) key from data dict
+                    for key, value in data["data"].items():
+                        return value.get("last_price", 0.0)
+                
+                logger.error(f"❌ Error fetching LTP: {data}")
                 return 0.0
         except Exception as e:
             logger.error(f"❌ Error fetching LTP: {e}")
@@ -482,10 +486,11 @@ class UpstoxOptionsBot:
         logger.info(f"🔍 ANALYSIS CYCLE - {datetime.now(IST).strftime('%H:%M:%S')}")
         logger.info("="*60)
         
-        # Priority: Indices first, then stocks
-        all_symbols = INDICES + NIFTY50_STOCKS
+        # Test with INDICES ONLY first (stocks need ISIN codes)
+        test_symbols = INDICES  # Only indices for now
+        logger.info(f"📊 Testing {len(test_symbols)} indices (stocks disabled until ISIN mapping added)\n")
         
-        for symbol in all_symbols:
+        for symbol in test_symbols:
             try:
                 analysis = await self.analyzer.analyze_symbol(symbol)
                 
