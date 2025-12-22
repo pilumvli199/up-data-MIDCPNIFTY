@@ -37,7 +37,8 @@ MARKET_START = dt_time(9, 15)
 MARKET_END = dt_time(15, 30)
 IST = pytz.timezone('Asia/Kolkata')
 
-INDICES = ["NIFTY"]  # Focus on NIFTY
+# ✅ ALL INDICES ADDED
+INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -450,7 +451,7 @@ class UpstoxClient:
             "Content-Type": "application/json"
         }
         self.instruments_cache = None
-        self.futures_key = None
+        self.futures_keys = {}  # Cache for each symbol's futures
         
     async def create_session(self):
         if not self.session:
@@ -461,11 +462,12 @@ class UpstoxClient:
             await self.session.close()
     
     def get_instrument_key(self, symbol: str) -> str:
+        """✅ FIXED: Correct instrument keys for all indices"""
         mapping = {
             "NIFTY": "NSE_INDEX|Nifty 50",
             "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-            "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
-            "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
+            "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
+            "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT"
         }
         return mapping.get(symbol, f"NSE_EQ|{symbol}")
     
@@ -486,23 +488,24 @@ class UpstoxClient:
                 logger.info(f"✅ Downloaded {len(instruments)} instruments")
                 self.instruments_cache = instruments
                 
-                # Find NIFTY futures for volume
+                # Find futures for all symbols
                 now = datetime.now(IST)
-                for instrument in instruments:
-                    if instrument.get('segment') != 'NSE_FO':
-                        continue
-                    if instrument.get('instrument_type') != 'FUT':
-                        continue
-                    if instrument.get('name') != 'NIFTY':
-                        continue
-                    
-                    expiry = instrument.get('expiry')
-                    if expiry:
-                        expiry_dt = datetime.fromtimestamp(expiry / 1000, tz=IST)
-                        if expiry_dt > now:
-                            self.futures_key = instrument.get('instrument_key')
-                            logger.info(f"✅ Futures found: {self.futures_key}")
-                            break
+                for symbol in INDICES:
+                    for instrument in instruments:
+                        if instrument.get('segment') != 'NSE_FO':
+                            continue
+                        if instrument.get('instrument_type') != 'FUT':
+                            continue
+                        if instrument.get('name') != symbol:
+                            continue
+                        
+                        expiry = instrument.get('expiry')
+                        if expiry:
+                            expiry_dt = datetime.fromtimestamp(expiry / 1000, tz=IST)
+                            if expiry_dt > now:
+                                self.futures_keys[symbol] = instrument.get('instrument_key')
+                                logger.info(f"✅ {symbol} Futures: {self.futures_keys[symbol]}")
+                                break
                 
                 return instruments
                 
@@ -576,18 +579,17 @@ class UpstoxClient:
         return quote["ltp"]
     
     async def get_historical_candles_combined(self, instrument_key: str) -> pd.DataFrame:
-        """FIXED: Get 200+ candles using proper V3 API endpoints"""
+        """Get 200+ candles using proper V3 API endpoints"""
         try:
             all_candles = []
             now = datetime.now(IST)
             
-            # ✅ FIXED: Use V3 Intraday API for today's 5-minute candles
+            # Intraday 5-min candles
             logger.info("📊 Fetching intraday 5-min candles (V3 API)...")
             url_intraday = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/minutes/5"
             
             async with self.session.get(url_intraday) as response:
                 response_text = await response.text()
-                logger.info(f"Intraday response status: {response.status}")
                 
                 if response.status == 200:
                     data = json.loads(response_text)
@@ -606,12 +608,8 @@ class UpstoxClient:
                                 'volume': candle[5],
                                 'oi': candle[6] if len(candle) > 6 else 0
                             })
-                    else:
-                        logger.warning(f"⚠️ No intraday candles in response")
-                else:
-                    logger.error(f"❌ Intraday API failed: {response.status} - {response_text[:200]}")
             
-            # ✅ FIXED: Use V3 Historical API for past days (5-minute data from last 30 days)
+            # Historical 5-min candles from past 30 days
             logger.info("📊 Fetching historical 5-min candles (V3 API)...")
             
             to_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -621,7 +619,6 @@ class UpstoxClient:
             
             async with self.session.get(url_historical) as response:
                 response_text = await response.text()
-                logger.info(f"Historical response status: {response.status}")
                 
                 if response.status == 200:
                     data = json.loads(response_text)
@@ -640,10 +637,6 @@ class UpstoxClient:
                                 'volume': candle[5],
                                 'oi': candle[6] if len(candle) > 6 else 0
                             })
-                    else:
-                        logger.warning(f"⚠️ No historical candles in response")
-                else:
-                    logger.error(f"❌ Historical API failed: {response.status} - {response_text[:200]}")
             
             if not all_candles:
                 logger.error("❌ No candles fetched from any source")
@@ -664,16 +657,16 @@ class UpstoxClient:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
     
-    async def get_futures_volume_map(self, candles_df: pd.DataFrame) -> Dict:
+    async def get_futures_volume_map(self, candles_df: pd.DataFrame, symbol: str) -> Dict:
         """Get volume data from futures for each candle timestamp"""
         volume_map = {}
         
-        if not self.futures_key:
+        futures_key = self.futures_keys.get(symbol)
+        if not futures_key:
             return volume_map
         
         try:
-            # ✅ FIXED: Use V3 API for futures intraday
-            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{self.futures_key}/minutes/5"
+            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{futures_key}/minutes/5"
             
             async with self.session.get(url) as response:
                 data = await response.json()
@@ -686,10 +679,10 @@ class UpstoxClient:
                         volume = candle[5]
                         volume_map[timestamp] = volume
             
-            logger.info(f"✅ Fetched volume for {len(volume_map)} candles from futures")
+            logger.info(f"✅ Fetched volume for {len(volume_map)} candles from {symbol} futures")
             
         except Exception as e:
-            logger.error(f"⚠️ Futures volume fetch failed: {e}")
+            logger.error(f"⚠️ Futures volume fetch failed for {symbol}: {e}")
         
         return volume_map
     
@@ -710,7 +703,7 @@ class UpstoxClient:
                 if data.get("status") == "success":
                     contracts = data.get("data", [])
                     if contracts:
-                        logger.info(f"✅ Fetched {len(contracts)} option contracts")
+                        logger.info(f"✅ Fetched {len(contracts)} option contracts for {symbol}")
                         return contracts
                     return []
                 return []
@@ -725,7 +718,13 @@ class OptionAnalyzer:
         self.client = client
     
     def get_strike_interval(self, symbol: str) -> int:
-        intervals = {"NIFTY": 50, "BANKNIFTY": 100, "MIDCPNIFTY": 25, "FINNIFTY": 50}
+        """✅ Correct strike intervals for all indices"""
+        intervals = {
+            "NIFTY": 50, 
+            "BANKNIFTY": 100, 
+            "MIDCPNIFTY": 25, 
+            "FINNIFTY": 50
+        }
         return intervals.get(symbol, 100)
     
     async def filter_atm_strikes(self, contracts: List[Dict], current_price: float, symbol: str) -> Dict:
@@ -786,26 +785,26 @@ class OptionAnalyzer:
             current_price = await self.client.get_ltp(instrument_key)
             
             if current_price == 0:
-                logger.warning(f"⚠️ Could not fetch price")
+                logger.warning(f"⚠️ Could not fetch price for {symbol}")
                 return None
             
-            logger.info(f"💰 Spot: ₹{current_price:,.2f}")
+            logger.info(f"💰 {symbol} Spot: ₹{current_price:,.2f}")
             
             # Get 200+ candles
             candles = await self.client.get_historical_candles_combined(instrument_key)
             
             if candles.empty:
-                logger.warning(f"⚠️ No candle data")
+                logger.warning(f"⚠️ No candle data for {symbol}")
                 return None
             
-            logger.info(f"📈 Loaded {len(candles)} candles")
+            logger.info(f"📈 Loaded {len(candles)} candles for {symbol}")
             
             # Get futures volume
-            volume_map = await self.client.get_futures_volume_map(candles)
+            volume_map = await self.client.get_futures_volume_map(candles, symbol)
             
             # Detect patterns with volume
             patterns = CandlestickPatterns.detect_patterns_with_volume(candles, volume_map)
-            logger.info(f"🎯 Found {len(patterns)} patterns")
+            logger.info(f"🎯 Found {len(patterns)} patterns for {symbol}")
             
             # Identify S/R levels
             sr_levels = SupportResistance.identify_levels(candles, current_price)
@@ -815,7 +814,7 @@ class OptionAnalyzer:
             # Get expiry
             expiries = await self.client.get_available_expiries(symbol)
             if not expiries:
-                logger.warning(f"⚠️ No expiries found")
+                logger.warning(f"⚠️ No expiries found for {symbol}")
                 return None
             
             contracts = []
@@ -828,13 +827,13 @@ class OptionAnalyzer:
                     break
             
             if not contracts or not expiry:
-                logger.warning(f"⚠️ No option contracts found")
+                logger.warning(f"⚠️ No option contracts found for {symbol}")
                 return None
             
             contracts_data = await self.filter_atm_strikes(contracts, current_price, symbol)
             
             if not contracts_data["strikes"]:
-                logger.warning(f"⚠️ No strikes in ATM range")
+                logger.warning(f"⚠️ No strikes in ATM range for {symbol}")
                 return None
             
             await self.fetch_option_prices(contracts_data)
@@ -874,11 +873,11 @@ class OptionAnalyzer:
             
             atm_strike = round(current_price / self.get_strike_interval(symbol)) * self.get_strike_interval(symbol)
             
-            # ✅ CONFLUENCE ANALYSIS
+            # Confluence analysis
             confluences = []
             trade_signals = []
             
-            for pattern in patterns[-10:]:  # Last 10 patterns
+            for pattern in patterns[-10:]:
                 confluence = ConfluenceAnalyzer.analyze_pattern_confluence(
                     pattern, sr_levels, strike_data, atm_strike
                 )
@@ -886,12 +885,11 @@ class OptionAnalyzer:
                 if confluence:
                     confluences.append(confluence)
                     
-                    # Generate trade signal
                     signal = ConfluenceAnalyzer.generate_trade_signal(confluence, atm_strike)
                     if signal:
                         trade_signals.append(signal)
             
-            logger.info(f"✅ Found {len(confluences)} confluences, {len(trade_signals)} trade signals")
+            logger.info(f"✅ {symbol}: {len(confluences)} confluences, {len(trade_signals)} trade signals")
             
             return {
                 "symbol": symbol,
@@ -910,12 +908,12 @@ class OptionAnalyzer:
             }
             
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Error analyzing {symbol}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
 
-# ======================== CHART GENERATOR (LARGER SIZE) ========================
+# ======================== CHART GENERATOR ========================
 class ChartGenerator:
     @staticmethod
     def create_combined_chart(analysis: Dict) -> BytesIO:
@@ -928,11 +926,10 @@ class ChartGenerator:
         confluences = analysis.get("confluences", [])
         trade_signals = analysis.get("trade_signals", [])
         
-        # ✅ INCREASED SIZE: 24x16 inches
         fig = plt.figure(figsize=(24, 16), facecolor='white')
         gs = GridSpec(4, 1, height_ratios=[2.5, 0.8, 1, 1], hspace=0.4)
         
-        # ========== CANDLESTICK CHART ==========
+        # Candlestick chart
         ax1 = fig.add_subplot(gs[0])
         
         mc = mpf.make_marketcolors(
@@ -947,7 +944,6 @@ class ChartGenerator:
             facecolor='white', figcolor='white', y_on_right=False
         )
         
-        # Show last 100 candles on chart
         candles_display = candles.tail(100)
         
         mpf.plot(
@@ -955,7 +951,7 @@ class ChartGenerator:
             volume=False, show_nontrading=False
         )
         
-        # Draw Support Levels
+        # Support levels
         for support in sr_levels['support']:
             ax1.axhline(y=support, color='green', linestyle='--', linewidth=2.5, alpha=0.7)
             ax1.text(0.02, support, f'  Support ₹{support:.0f}', 
@@ -963,7 +959,7 @@ class ChartGenerator:
                     color='green', fontsize=11, fontweight='bold', va='center',
                     bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
         
-        # Draw Resistance Levels
+        # Resistance levels
         for resistance in sr_levels['resistance']:
             ax1.axhline(y=resistance, color='red', linestyle='--', linewidth=2.5, alpha=0.7)
             ax1.text(0.02, resistance, f'  Resistance ₹{resistance:.0f}', 
@@ -971,13 +967,12 @@ class ChartGenerator:
                     color='red', fontsize=11, fontweight='bold', va='center',
                     bbox=dict(boxstyle='round,pad=0.5', facecolor='lightcoral', alpha=0.8))
         
-        # Mark Candlestick Patterns
+        # Mark patterns
         for pattern in patterns[-8:]:
             idx = pattern['index']
             if idx < len(candles):
                 candle_time = candles.index[idx]
                 
-                # Check if in display range
                 if candle_time not in candles_display.index:
                     continue
                 
@@ -1001,7 +996,7 @@ class ChartGenerator:
                      fontsize=18, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
-        # ========== CONFLUENCE & SIGNALS SECTION ==========
+        # Signals section
         ax_signals = fig.add_subplot(gs[1])
         ax_signals.axis('off')
         
@@ -1020,7 +1015,7 @@ class ChartGenerator:
                        fontsize=12, verticalalignment='top', fontfamily='monospace',
                        bbox=dict(boxstyle='round', facecolor='#ffffcc', alpha=0.9, edgecolor='orange', linewidth=2))
         
-        # ========== PATTERN DETAILS SECTION ==========
+        # Pattern details
         ax_patterns = fig.add_subplot(gs[2])
         ax_patterns.axis('off')
         
@@ -1035,8 +1030,7 @@ class ChartGenerator:
         else:
             pattern_text += "\n  No patterns detected in recent candles.\n"
         
-        # Add S/R with PCR
-        interval = 50
+        interval = 50 if symbol == "NIFTY" or symbol == "FINNIFTY" else (100 if symbol == "BANKNIFTY" else 25)
         pattern_text += f"\n📍 SUPPORT & RESISTANCE:\n"
         
         for support in sr_levels['support']:
@@ -1055,7 +1049,7 @@ class ChartGenerator:
                         fontsize=11, verticalalignment='top', fontfamily='monospace',
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # ========== OPTION CHAIN TABLE ==========
+        # Option chain table
         ax2 = fig.add_subplot(gs[3])
         ax2.axis('tight')
         ax2.axis('off')
@@ -1173,7 +1167,6 @@ class TelegramAlerter:
             else:
                 bias = "🔴 BEARISH"
             
-            # Trade signals summary
             trade_signals = analysis.get('trade_signals', [])
             signals_text = ""
             
@@ -1204,12 +1197,12 @@ class TelegramAlerter:
                 caption=caption
             )
             
-            logger.info(f"✅ Alert sent")
+            logger.info(f"✅ {symbol} Alert sent")
             
         except TelegramError as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"❌ Telegram error for {symbol}: {e}")
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Error sending {symbol}: {e}")
 
 # ======================== MAIN BOT ========================
 class UpstoxOptionsBot:
@@ -1249,7 +1242,7 @@ class UpstoxOptionsBot:
                 await asyncio.sleep(2)
                 
             except Exception as e:
-                logger.error(f"❌ Error: {e}\n")
+                logger.error(f"❌ {symbol} Error: {e}\n")
         
         logger.info("="*70)
         logger.info("✅ CYCLE COMPLETE")
@@ -1260,16 +1253,15 @@ class UpstoxOptionsBot:
         market_status = "🟢 OPEN" if self.is_market_open() else "🔴 CLOSED"
         
         print("\n" + "="*70)
-        print("🚀 FIXED UPSTOX BOT - V3 API VERSION", flush=True)
+        print("🚀 UPSTOX BOT - ALL INDICES | V3 API", flush=True)
         print("="*70)
         print(f"📅 {current_time.strftime('%d-%b-%Y %A')}", flush=True)
         print(f"🕐 {current_time.strftime('%H:%M:%S IST')}", flush=True)
         print(f"📊 Market: {market_status}", flush=True)
+        print(f"📈 Tracking: {', '.join(INDICES)}", flush=True)
         print(f"⏱️  Interval: 5 minutes", flush=True)
-        print(f"✅ Using V3 API for 5-min candles", flush=True)
-        print(f"✅ Pattern-Strike-PCR Confluence", flush=True)
-        print(f"✅ Trade Signals (Entry/SL/Target)", flush=True)
-        print(f"📈 200+ Candles | Chart: 24x16", flush=True)
+        print(f"✅ V3 API | 200+ Candles | 24x16 Charts", flush=True)
+        print(f"✅ Pattern-Strike-PCR Confluence | Trade Signals", flush=True)
         print("="*70 + "\n", flush=True)
         
         await self.client.create_session()
