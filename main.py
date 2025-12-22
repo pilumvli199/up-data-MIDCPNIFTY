@@ -113,8 +113,55 @@ class UpstoxClient:
             logger.error(f"❌ Error fetching candles: {e}")
             return pd.DataFrame()
     
+    async def get_available_expiries(self, symbol: str) -> List[str]:
+        """✅ Get ALL available expiries from Upstox API (like Dhan)"""
+        try:
+            instrument_key = self.get_instrument_key(symbol)
+            
+            # ✅ UPSTOX EXPIRY LIST API (same as Dhan pattern)
+            url = f"{UPSTOX_API_URL}/expired-instruments/expiries"
+            params = {"instrument_key": instrument_key}
+            
+            logger.info(f"   📅 Fetching expiries for {symbol}...")
+            logger.debug(f"      URL: {url}")
+            logger.debug(f"      Params: {params}")
+            
+            async with self.session.get(url, params=params) as response:
+                response_text = await response.text()
+                logger.debug(f"      Response: {response_text[:200]}...")
+                
+                data = json.loads(response_text)
+                
+                if data.get("status") == "success" and data.get("data"):
+                    expiries = data["data"]
+                    
+                    # Filter future expiries only (आजच्या नंतरचे)
+                    today = datetime.now(IST).date()
+                    future_expiries = [
+                        exp for exp in expiries 
+                        if datetime.strptime(exp, "%Y-%m-%d").date() >= today
+                    ]
+                    
+                    if future_expiries:
+                        logger.info(f"   ✅ Found {len(future_expiries)} future expiries")
+                        logger.info(f"      Nearest: {future_expiries[:3]}")
+                        return future_expiries
+                    else:
+                        logger.warning(f"   ⚠️ No future expiries found")
+                        logger.info(f"      All expiries: {expiries[:5]}")
+                        return []
+                else:
+                    logger.error(f"   ❌ Expiry API error: {data}")
+                    return []
+                    
+        except Exception as e:
+            logger.error(f"❌ Error fetching expiries: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+    
     async def get_option_contracts(self, symbol: str, expiry: str) -> List[Dict]:
-        """Get all option contracts for symbol and expiry using Upstox API"""
+        """Get all option contracts for symbol and expiry"""
         try:
             instrument_key = self.get_instrument_key(symbol)
             url = f"{UPSTOX_API_URL}/option/contract"
@@ -139,8 +186,7 @@ class UpstoxClient:
                         logger.info(f"   ✅ Fetched {len(contracts)} option contracts")
                         return contracts
                     else:
-                        # Try with next expiry if no contracts found
-                        logger.warning(f"   ⚠️ No contracts for {expiry}, this might not be a valid expiry")
+                        logger.warning(f"   ⚠️ No contracts for expiry {expiry}")
                         return []
                 else:
                     logger.error(f"   ❌ API Error: {data}")
@@ -150,29 +196,6 @@ class UpstoxClient:
             logger.error(f"❌ Error fetching option contracts: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return []
-    
-    async def get_expiries(self, symbol: str) -> List[str]:
-        """Get available expiries for symbol - returns next 2 Thursdays"""
-        try:
-            today = datetime.now(IST).date()
-            expiries = []
-            
-            # Find next Thursday
-            days_ahead = (3 - today.weekday()) % 7  # Thursday = 3
-            if days_ahead == 0:
-                days_ahead = 7
-            
-            # Get next 2 Thursdays (weekly expiries)
-            for i in range(2):
-                next_expiry = today + timedelta(days=days_ahead + (i * 7))
-                expiries.append(next_expiry.strftime("%Y-%m-%d"))
-            
-            logger.debug(f"   📅 Available expiries: {expiries}")
-            return expiries
-            
-        except Exception as e:
-            logger.error(f"❌ Error calculating expiry: {e}")
             return []
 
 # ======================== OPTION CHAIN ANALYZER ========================
@@ -271,17 +294,18 @@ class OptionAnalyzer:
             
             logger.info(f"   📈 Fetched {len(candles)} candles")
             
-            # Get nearest expiry
-            expiries = await self.client.get_expiries(symbol)
+            # ✅ Get available expiries from API (Dhan pattern)
+            expiries = await self.client.get_available_expiries(symbol)
+            
             if not expiries:
-                logger.warning(f"⚠️ No expiry found for {symbol}")
+                logger.warning(f"⚠️ No expiries found for {symbol}")
                 return None
             
             # Try each expiry until we find contracts
             contracts = []
             expiry = None
             
-            for exp_date in expiries:
+            for exp_date in expiries[:3]:  # Try first 3 expiries
                 logger.info(f"   📅 Trying expiry: {exp_date}")
                 contracts = await self.client.get_option_contracts(symbol, exp_date)
                 
@@ -563,6 +587,7 @@ class UpstoxOptionsBot:
         print(f"📊 Symbols: {len(INDICES)} indices", flush=True)
         print(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}", flush=True)
         print(f"🎯 ATM Range: ±{ATM_RANGE} strikes", flush=True)
+        print("✅ FIXED: Using Upstox Expiry List API", flush=True)
         print("="*60 + "\n", flush=True)
         
         await self.client.create_session()
@@ -577,6 +602,7 @@ class UpstoxOptionsBot:
         logger.info(f"📊 Symbols: {len(INDICES)} indices")
         logger.info(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}")
         logger.info(f"🎯 ATM Range: ±{ATM_RANGE} strikes")
+        logger.info("✅ FIXED: Using Upstox Expiry List API")
         logger.info("="*60 + "\n")
         
         try:
