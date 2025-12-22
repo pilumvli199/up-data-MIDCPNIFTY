@@ -19,6 +19,7 @@ import pytz
 import os
 
 UPSTOX_API_URL = "https://api.upstox.com/v2"
+UPSTOX_API_V3_URL = "https://api.upstox.com/v3"  # New V3 endpoint
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
@@ -61,7 +62,8 @@ class UpstoxClient:
         self.session = None
         self.headers = {
             "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
         
     async def create_session(self):
@@ -104,19 +106,26 @@ class UpstoxClient:
                     for key, value in data["data"].items():
                         return value.get("last_price", 0.0)
                 
-                logger.error(f"❌ Error fetching LTP: {data}")
+                logger.error(f"❌ Error fetching LTP for {instrument_key}: {data}")
                 return 0.0
         except Exception as e:
             logger.error(f"❌ Error fetching LTP: {e}")
             return 0.0
     
     async def get_historical_candles(self, instrument_key: str, count: int = 50) -> pd.DataFrame:
-        """Get historical intraday candles (5 min)"""
+        """Get historical intraday candles (5 min) using V3 API"""
         try:
-            url = f"{UPSTOX_API_URL}/historical-candle/intraday/{instrument_key}/5minute"
+            # V3 API format: /v3/historical-candle/intraday/{instrument_key}/minutes/{interval}
+            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/minutes/5"
+            
+            logger.debug(f"   📡 Fetching candles from: {url}")
             
             async with self.session.get(url) as response:
-                data = await response.json()
+                response_text = await response.text()
+                logger.debug(f"   📥 Response status: {response.status}")
+                logger.debug(f"   📥 Response body: {response_text[:200]}...")
+                
+                data = json.loads(response_text)
                 
                 if data.get("status") == "success" and data.get("data", {}).get("candles"):
                     candles = data["data"]["candles"][:count]
@@ -126,11 +135,15 @@ class UpstoxClient:
                     df.set_index('timestamp', inplace=True)
                     df = df.sort_index()
                     
+                    logger.info(f"   ✅ Fetched {len(df)} candles successfully")
                     return df
-                
-                return pd.DataFrame()
+                else:
+                    logger.error(f"   ❌ API Error: {data}")
+                    return pd.DataFrame()
         except Exception as e:
-            logger.error(f"❌ Error fetching candles: {e}")
+            logger.error(f"❌ Error fetching candles for {instrument_key}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
     
     async def get_option_chain(self, symbol: str, expiry: str) -> Dict:
@@ -311,6 +324,8 @@ class OptionAnalyzer:
             
         except Exception as e:
             logger.error(f"❌ Error analyzing {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
 # ======================== CHART GENERATOR ========================
@@ -470,6 +485,12 @@ class UpstoxOptionsBot:
     def is_market_open(self) -> bool:
         """Check if market is open"""
         now = datetime.now(IST).time()
+        today = datetime.now(IST).date()
+        
+        # Check if weekend
+        if today.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            return False
+            
         return MARKET_START <= now <= MARKET_END
     
     async def process_symbols(self):
@@ -510,6 +531,8 @@ class UpstoxOptionsBot:
                 
             except Exception as e:
                 logger.error(f"❌ Error processing {symbol}: {e}\n")
+                import traceback
+                logger.error(traceback.format_exc())
         
         logger.info("="*60)
         logger.info("✅ CYCLE COMPLETE")
@@ -560,6 +583,8 @@ class UpstoxOptionsBot:
                     
                 except Exception as e:
                     logger.error(f"❌ Error in main loop: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     await asyncio.sleep(60)
         
         except KeyboardInterrupt:
