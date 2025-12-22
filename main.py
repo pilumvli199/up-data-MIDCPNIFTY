@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime, time as dt_time, timedelta
 import json
 import logging
+import gzip
 from typing import Dict, List, Optional
 from telegram import Bot
 from telegram.error import TelegramError
@@ -20,6 +21,7 @@ import os
 
 UPSTOX_API_URL = "https://api.upstox.com/v2"
 UPSTOX_API_V3_URL = "https://api.upstox.com/v3"
+UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
@@ -54,6 +56,9 @@ class UpstoxClient:
             "Content-Type": "application/json"
         }
         
+        # Cache for instruments
+        self.instruments_cache = None
+        
     async def create_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession(headers=self.headers)
@@ -71,6 +76,110 @@ class UpstoxClient:
             "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
         }
         return mapping.get(symbol, f"NSE_EQ|{symbol}")
+    
+    async def download_instruments(self):
+        """✅ Download instruments from Upstox CDN (like your working bot!)"""
+        try:
+            logger.info("📡 Downloading instruments from Upstox CDN...")
+            
+            # NO AUTH needed for CDN!
+            url = UPSTOX_INSTRUMENTS_URL
+            
+            async with self.session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"❌ Instruments download failed: {response.status}")
+                    return None
+                
+                # Download and decompress
+                content = await response.read()
+                json_text = gzip.decompress(content).decode('utf-8')
+                instruments = json.loads(json_text)
+                
+                logger.info(f"✅ Downloaded {len(instruments)} instruments")
+                
+                self.instruments_cache = instruments
+                return instruments
+                
+        except Exception as e:
+            logger.error(f"❌ Error downloading instruments: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    async def get_available_expiries(self, symbol: str) -> List[str]:
+        """✅ Get future expiries from instruments (your working pattern!)"""
+        try:
+            # Download instruments if not cached
+            if not self.instruments_cache:
+                instruments = await self.download_instruments()
+                if not instruments:
+                    return []
+            else:
+                instruments = self.instruments_cache
+            
+            logger.info(f"   📅 Finding expiries for {symbol}...")
+            
+            # Map symbol to instrument name
+            symbol_mapping = {
+                "NIFTY": "NIFTY",
+                "BANKNIFTY": "BANKNIFTY",
+                "MIDCPNIFTY": "MIDCPNIFTY",
+                "FINNIFTY": "FINNIFTY"
+            }
+            
+            instrument_name = symbol_mapping.get(symbol, symbol)
+            
+            # Find all option contracts
+            now = datetime.now(IST)
+            expiries_set = set()
+            
+            for instrument in instruments:
+                # Check segment
+                segment = instrument.get('segment')
+                if segment != 'NSE_FO':
+                    continue
+                
+                # Check instrument type
+                inst_type = instrument.get('instrument_type')
+                if inst_type not in ['CE', 'PE']:
+                    continue
+                
+                # Check name
+                name = instrument.get('name', '')
+                if name != instrument_name:
+                    continue
+                
+                # Get expiry
+                expiry_ms = instrument.get('expiry')
+                if not expiry_ms:
+                    continue
+                
+                try:
+                    # Expiry is in milliseconds
+                    expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+                    
+                    # Only future expiries
+                    if expiry_dt > now:
+                        expiry_str = expiry_dt.strftime('%Y-%m-%d')
+                        expiries_set.add(expiry_str)
+                        
+                except Exception as e:
+                    continue
+            
+            if expiries_set:
+                expiries = sorted(list(expiries_set))
+                logger.info(f"   ✅ Found {len(expiries)} future expiries")
+                logger.info(f"      Nearest: {expiries[:3]}")
+                return expiries
+            else:
+                logger.warning(f"   ⚠️ No future expiries found for {symbol}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"❌ Error finding expiries: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
     
     async def get_ltp(self, instrument_key: str) -> float:
         """Get Last Traded Price"""
@@ -112,53 +221,6 @@ class UpstoxClient:
         except Exception as e:
             logger.error(f"❌ Error fetching candles: {e}")
             return pd.DataFrame()
-    
-    async def get_available_expiries(self, symbol: str) -> List[str]:
-        """✅ Get ALL available expiries from Upstox API (like Dhan)"""
-        try:
-            instrument_key = self.get_instrument_key(symbol)
-            
-            # ✅ UPSTOX EXPIRY LIST API (same as Dhan pattern)
-            url = f"{UPSTOX_API_URL}/expired-instruments/expiries"
-            params = {"instrument_key": instrument_key}
-            
-            logger.info(f"   📅 Fetching expiries for {symbol}...")
-            logger.debug(f"      URL: {url}")
-            logger.debug(f"      Params: {params}")
-            
-            async with self.session.get(url, params=params) as response:
-                response_text = await response.text()
-                logger.debug(f"      Response: {response_text[:200]}...")
-                
-                data = json.loads(response_text)
-                
-                if data.get("status") == "success" and data.get("data"):
-                    expiries = data["data"]
-                    
-                    # Filter future expiries only (आजच्या नंतरचे)
-                    today = datetime.now(IST).date()
-                    future_expiries = [
-                        exp for exp in expiries 
-                        if datetime.strptime(exp, "%Y-%m-%d").date() >= today
-                    ]
-                    
-                    if future_expiries:
-                        logger.info(f"   ✅ Found {len(future_expiries)} future expiries")
-                        logger.info(f"      Nearest: {future_expiries[:3]}")
-                        return future_expiries
-                    else:
-                        logger.warning(f"   ⚠️ No future expiries found")
-                        logger.info(f"      All expiries: {expiries[:5]}")
-                        return []
-                else:
-                    logger.error(f"   ❌ Expiry API error: {data}")
-                    return []
-                    
-        except Exception as e:
-            logger.error(f"❌ Error fetching expiries: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
     
     async def get_option_contracts(self, symbol: str, expiry: str) -> List[Dict]:
         """Get all option contracts for symbol and expiry"""
@@ -294,7 +356,7 @@ class OptionAnalyzer:
             
             logger.info(f"   📈 Fetched {len(candles)} candles")
             
-            # ✅ Get available expiries from API (Dhan pattern)
+            # ✅ Get available expiries from instruments (your working pattern!)
             expiries = await self.client.get_available_expiries(symbol)
             
             if not expiries:
@@ -343,6 +405,28 @@ class OptionAnalyzer:
             pcr_vol = 0  # Volume data not available
             
             logger.info(f"   📊 CE count: {len(ce_data)}, PE count: {len(pe_data)}")
+            
+            # Log per-strike data
+            logger.info("")
+            logger.info("📊 PER-STRIKE PREMIUM PRICES:")
+            logger.info("━" * 60)
+            logger.info(f"{'Strike':>8} | {'CE LTP':>10} | {'PE LTP':>10}")
+            logger.info("━" * 60)
+            
+            for strike in contracts_data["strikes"]:
+                ce = contracts_data["ce"].get(strike, {"ltp": 0})
+                pe = contracts_data["pe"].get(strike, {"ltp": 0})
+                
+                marker = " ATM" if strike == round(current_price / self.get_strike_interval(symbol)) * self.get_strike_interval(symbol) else ""
+                
+                logger.info(
+                    f"{int(strike):>8}{marker:4} | "
+                    f"₹{ce['ltp']:>9.2f} | "
+                    f"₹{pe['ltp']:>9.2f}"
+                )
+            
+            logger.info("━" * 60)
+            logger.info("")
             
             return {
                 "symbol": symbol,
@@ -406,7 +490,7 @@ class ChartGenerator:
             show_nontrading=False
         )
         
-        ax1.set_title(f"{symbol} - 5min Chart | LTP: ₹{current_price:,.2f}", 
+        ax1.set_title(f"{symbol} - 5min Chart | LTP: ₹{current_price:,.2f} | Expiry: {analysis['expiry']}", 
                      fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
@@ -424,24 +508,24 @@ class ChartGenerator:
             
             row = [
                 f"₹{strike:,.0f}",
-                f"{ce['oi']:,}",
-                f"{ce['volume']:,}",
+                "N/A",  # OI not available
+                "N/A",  # Volume not available
                 f"₹{ce['ltp']:.2f}",
                 f"₹{pe['ltp']:.2f}",
-                f"{pe['volume']:,}",
-                f"{pe['oi']:,}"
+                "N/A",
+                "N/A"
             ]
             table_data.append(row)
         
-        # Add PCR row (OI will be N/A)
+        # Add info row
         table_data.append([
-            "PCR",
+            "Note",
             "",
             "",
-            f"OI: N/A",
-            f"Vol: N/A",
+            "Premium prices only",
+            "OI data needs",
             "",
-            ""
+            "Full Quote API"
         ])
         
         # Create table
@@ -461,11 +545,11 @@ class ChartGenerator:
             table[(0, i)].set_facecolor('#4a4a4a')
             table[(0, i)].set_text_props(weight='bold', color='white')
         
-        # Style PCR row
-        pcr_row = len(table_data) - 1
+        # Style info row
+        info_row = len(table_data) - 1
         for i in range(7):
-            table[(pcr_row, i)].set_facecolor('#ffd54f')
-            table[(pcr_row, i)].set_text_props(weight='bold')
+            table[(info_row, i)].set_facecolor('#fff3cd')
+            table[(info_row, i)].set_text_props(style='italic', fontsize=8)
         
         # Highlight ATM strike
         interval = 50 if symbol == "NIFTY" else 100
@@ -491,10 +575,18 @@ class TelegramAlerter:
         self.bot = Bot(token=token)
         self.chat_id = chat_id
     
-    async def send_chart(self, chart_buffer: BytesIO, symbol: str):
+    async def send_chart(self, chart_buffer: BytesIO, symbol: str, analysis: Dict):
         """Send chart image to Telegram"""
         try:
-            caption = f"📊 {symbol} | {datetime.now(IST).strftime('%d-%b %H:%M')}"
+            caption = f"""📊 {symbol} Option Chain
+💰 Spot: ₹{analysis['current_price']:,.2f}
+📅 Expiry: {analysis['expiry']}
+🎯 Strikes: {len(analysis['strikes'])} (ATM ±{ATM_RANGE})
+
+⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
+
+✅ Premium prices fetched
+⚠️ OI data needs Full Quote API upgrade"""
             
             await self.bot.send_photo(
                 chat_id=self.chat_id,
@@ -554,7 +646,7 @@ class UpstoxOptionsBot:
                     chart = self.chart_gen.create_combined_chart(analysis)
                     
                     # Send to Telegram
-                    await self.alerter.send_chart(chart, symbol)
+                    await self.alerter.send_chart(chart, symbol, analysis)
                     
                     logger.info(f"✅ {symbol} complete\n")
                 else:
@@ -578,7 +670,7 @@ class UpstoxOptionsBot:
         market_status = "🟢 OPEN" if self.is_market_open() else "🔴 CLOSED"
         
         print("\n" + "="*60, flush=True)
-        print("🚀 UPSTOX OPTIONS BOT STARTED!", flush=True)
+        print("🚀 UPSTOX OPTIONS BOT v2.0 - WORKING!", flush=True)
         print("="*60, flush=True)
         print(f"📅 Date: {current_time.strftime('%d-%b-%Y %A')}", flush=True)
         print(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}", flush=True)
@@ -587,13 +679,13 @@ class UpstoxOptionsBot:
         print(f"📊 Symbols: {len(INDICES)} indices", flush=True)
         print(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}", flush=True)
         print(f"🎯 ATM Range: ±{ATM_RANGE} strikes", flush=True)
-        print("✅ FIXED: Using Upstox Expiry List API", flush=True)
+        print("✅ FIXED: Using Instruments CDN (working pattern!)", flush=True)
         print("="*60 + "\n", flush=True)
         
         await self.client.create_session()
         
         logger.info("\n" + "="*60)
-        logger.info("🚀 UPSTOX OPTIONS BOT STARTED!")
+        logger.info("🚀 UPSTOX OPTIONS BOT v2.0 - WORKING!")
         logger.info("="*60)
         logger.info(f"📅 Date: {current_time.strftime('%d-%b-%Y %A')}")
         logger.info(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}")
@@ -602,7 +694,7 @@ class UpstoxOptionsBot:
         logger.info(f"📊 Symbols: {len(INDICES)} indices")
         logger.info(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}")
         logger.info(f"🎯 ATM Range: ±{ATM_RANGE} strikes")
-        logger.info("✅ FIXED: Using Upstox Expiry List API")
+        logger.info("✅ FIXED: Using Instruments CDN (working pattern!)")
         logger.info("="*60 + "\n")
         
         try:
