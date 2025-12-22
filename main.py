@@ -635,38 +635,21 @@ class UpstoxClient:
         return quote["ltp"]
     
     async def get_historical_candles_combined(self, instrument_key: str) -> pd.DataFrame:
-        """Get 200+ candles by combining historical + intraday"""
+        """Get intraday candles only (indices don't support historical API)"""
         try:
             all_candles = []
             
-            # 1. Get historical daily candles (last 30 days)
-            url_daily = f"{UPSTOX_API_URL}/historical-candle/{instrument_key}/day/2023-01-01/2025-12-31"
+            # For INDEX instruments, ONLY use intraday API
+            # Historical API doesn't work for NSE_INDEX instruments
             
-            async with self.session.get(url_daily) as response:
-                data = await response.json()
-                
-                if data.get("status") == "success" and data.get("data", {}).get("candles"):
-                    daily_candles = data["data"]["candles"][-30:]  # Last 30 days
-                    
-                    for candle in daily_candles:
-                        all_candles.append({
-                            'timestamp': pd.to_datetime(candle[0]),
-                            'open': candle[1],
-                            'high': candle[2],
-                            'low': candle[3],
-                            'close': candle[4],
-                            'volume': candle[5],
-                            'oi': candle[6] if len(candle) > 6 else 0
-                        })
-            
-            # 2. Get intraday 5min candles (today)
-            url_intraday = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/5/minute"
+            # Get 5-minute intraday candles using V3 API
+            url_intraday = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/minutes/5"
             
             async with self.session.get(url_intraday) as response:
                 data = await response.json()
                 
                 if data.get("status") == "success" and data.get("data", {}).get("candles"):
-                    intraday_candles = data["data"]["candles"][:100]
+                    intraday_candles = data["data"]["candles"]
                     
                     for candle in intraday_candles:
                         all_candles.append({
@@ -675,11 +658,16 @@ class UpstoxClient:
                             'high': candle[2],
                             'low': candle[3],
                             'close': candle[4],
-                            'volume': candle[5],
+                            'volume': candle[5] if len(candle) > 5 else 0,
                             'oi': candle[6] if len(candle) > 6 else 0
                         })
+                    
+                    logger.info(f"✅ Fetched {len(intraday_candles)} intraday candles")
+                else:
+                    logger.warning(f"⚠️ No candle data in response: {data}")
             
             if not all_candles:
+                logger.warning(f"⚠️ No candles found for {instrument_key}")
                 return pd.DataFrame()
             
             df = pd.DataFrame(all_candles)
@@ -687,12 +675,14 @@ class UpstoxClient:
             df = df.sort_index()
             df = df[~df.index.duplicated(keep='last')]
             
-            logger.info(f"✅ Combined {len(df)} candles (Historical + Intraday)")
+            logger.info(f"✅ Loaded {len(df)} candles")
             
             return df
             
         except Exception as e:
             logger.error(f"❌ Error fetching candles: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
     
     async def get_futures_volume_map(self, candles_df: pd.DataFrame, symbol: str) -> Dict:
@@ -701,10 +691,12 @@ class UpstoxClient:
         
         futures_key = self.futures_keys.get(symbol)
         if not futures_key:
+            logger.warning(f"⚠️ No futures key for {symbol}")
             return volume_map
         
         try:
-            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{futures_key}/5/minute"
+            # Use V3 API with minutes/5 format
+            url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{futures_key}/minutes/5"
             
             async with self.session.get(url) as response:
                 data = await response.json()
@@ -714,7 +706,7 @@ class UpstoxClient:
                     
                     for candle in futures_candles:
                         timestamp = pd.to_datetime(candle[0])
-                        volume = candle[5]
+                        volume = candle[5] if len(candle) > 5 else 0
                         volume_map[timestamp] = volume
             
             logger.info(f"✅ Fetched volume for {len(volume_map)} candles from {symbol} futures")
