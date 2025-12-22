@@ -19,7 +19,7 @@ import pytz
 import os
 
 UPSTOX_API_URL = "https://api.upstox.com/v2"
-UPSTOX_API_V3_URL = "https://api.upstox.com/v3"  # New V3 endpoint
+UPSTOX_API_V3_URL = "https://api.upstox.com/v3"
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
@@ -33,18 +33,6 @@ ATM_RANGE = 5  # ±5 strikes
 MARKET_START = dt_time(9, 15)
 MARKET_END = dt_time(15, 30)
 IST = pytz.timezone('Asia/Kolkata')
-
-# NIFTY 50 stocks with ISIN codes (NSE symbols)
-NIFTY50_STOCKS = [
-    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
-    "SBIN", "BHARTIARTL", "BAJFINANCE", "KOTAKBANK", "LT", "ASIANPAINT", 
-    "AXISBANK", "MARUTI", "SUNPHARMA", "TITAN", "ULTRACEMCO", "NESTLEIND",
-    "WIPRO", "M&M", "NTPC", "HCLTECH", "TATAMOTORS", "TATASTEEL", "POWERGRID",
-    "BAJAJFINSV", "ONGC", "TECHM", "ADANIENT", "COALINDIA", "JSWSTEEL",
-    "INDUSINDBK", "GRASIM", "HINDALCO", "HDFCLIFE", "BRITANNIA", "CIPLA",
-    "BPCL", "EICHERMOT", "DRREDDY", "APOLLOHOSP", "DIVISLAB", "SBILIFE",
-    "BAJAJ-AUTO", "TATACONSUM", "HEROMOTOCO", "ADANIPORTS", "LTIM", "UPL"
-]
 
 INDICES = ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY"]
 
@@ -74,22 +62,15 @@ class UpstoxClient:
         if self.session:
             await self.session.close()
     
-    def get_instrument_key(self, symbol: str, segment: str = "NSE_INDEX") -> str:
-        """Get Upstox instrument key"""
-        # Index mapping (verified from Upstox docs)
-        if symbol in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY"]:
-            mapping = {
-                "NIFTY": "NSE_INDEX|Nifty 50",
-                "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-                "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
-                "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
-            }
-            return mapping.get(symbol)
-        else:
-            # For stocks - Upstox needs ISIN codes
-            # For now, using symbol directly (will get error but shows format)
-            # TODO: Add ISIN mapping
-            return f"NSE_EQ|{symbol}"
+    def get_instrument_key(self, symbol: str) -> str:
+        """Get Upstox instrument key for underlying"""
+        mapping = {
+            "NIFTY": "NSE_INDEX|Nifty 50",
+            "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+            "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+            "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
+        }
+        return mapping.get(symbol, f"NSE_EQ|{symbol}")
     
     async def get_ltp(self, instrument_key: str) -> float:
         """Get Last Traded Price"""
@@ -101,12 +82,9 @@ class UpstoxClient:
                 data = await response.json()
                 
                 if data.get("status") == "success" and data.get("data"):
-                    # Response format: {"status": "success", "data": {"NSE_EQ:NHPC": {"last_price": 52.05}}}
-                    # Get first (and only) key from data dict
                     for key, value in data["data"].items():
                         return value.get("last_price", 0.0)
                 
-                logger.error(f"❌ Error fetching LTP for {instrument_key}: {data}")
                 return 0.0
         except Exception as e:
             logger.error(f"❌ Error fetching LTP: {e}")
@@ -115,17 +93,10 @@ class UpstoxClient:
     async def get_historical_candles(self, instrument_key: str, count: int = 50) -> pd.DataFrame:
         """Get historical intraday candles (5 min) using V3 API"""
         try:
-            # V3 API format: /v3/historical-candle/intraday/{instrument_key}/minutes/{interval}
             url = f"{UPSTOX_API_V3_URL}/historical-candle/intraday/{instrument_key}/minutes/5"
             
-            logger.debug(f"   📡 Fetching candles from: {url}")
-            
             async with self.session.get(url) as response:
-                response_text = await response.text()
-                logger.debug(f"   📥 Response status: {response.status}")
-                logger.debug(f"   📥 Response body: {response_text[:200]}...")
-                
-                data = json.loads(response_text)
+                data = await response.json()
                 
                 if data.get("status") == "success" and data.get("data", {}).get("candles"):
                     candles = data["data"]["candles"][:count]
@@ -135,44 +106,47 @@ class UpstoxClient:
                     df.set_index('timestamp', inplace=True)
                     df = df.sort_index()
                     
-                    logger.info(f"   ✅ Fetched {len(df)} candles successfully")
                     return df
-                else:
-                    logger.error(f"   ❌ API Error: {data}")
-                    return pd.DataFrame()
+                
+                return pd.DataFrame()
         except Exception as e:
-            logger.error(f"❌ Error fetching candles for {instrument_key}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Error fetching candles: {e}")
             return pd.DataFrame()
     
-    async def get_option_chain(self, symbol: str, expiry: str) -> Dict:
-        """Get option chain data"""
+    async def get_option_contracts(self, symbol: str, expiry: str) -> List[Dict]:
+        """Get all option contracts for symbol and expiry using Upstox API"""
         try:
-            # Upstox option chain endpoint
-            url = f"{UPSTOX_API_URL}/option/chain"
+            instrument_key = self.get_instrument_key(symbol)
+            url = f"{UPSTOX_API_URL}/option/contract"
+            
             params = {
-                "instrument_key": self.get_instrument_key(symbol),
+                "instrument_key": instrument_key,
                 "expiry_date": expiry
             }
+            
+            logger.debug(f"   📡 Fetching option contracts from: {url}")
+            logger.debug(f"   📡 Params: {params}")
             
             async with self.session.get(url, params=params) as response:
                 data = await response.json()
                 
-                if data.get("status") == "success":
-                    return data["data"]
-                
-                return {}
+                if data.get("status") == "success" and data.get("data"):
+                    contracts = data["data"]
+                    logger.info(f"   ✅ Fetched {len(contracts)} option contracts")
+                    return contracts
+                else:
+                    logger.error(f"   ❌ API Error: {data}")
+                    return []
+                    
         except Exception as e:
-            logger.error(f"❌ Error fetching option chain: {e}")
-            return {}
+            logger.error(f"❌ Error fetching option contracts: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
     
     async def get_expiries(self, symbol: str) -> List[str]:
         """Get available expiries for symbol"""
         try:
-            # This is a placeholder - Upstox may have different endpoint
-            # For now, calculate nearest Thursday (weekly) / last Thursday (monthly)
-            
             today = datetime.now(IST).date()
             
             # Find next Thursday
@@ -193,63 +167,72 @@ class OptionAnalyzer:
     def __init__(self, client: UpstoxClient):
         self.client = client
     
-    async def get_atm_strikes(self, current_price: float, symbol: str) -> List[float]:
-        """Calculate ATM ±5 strikes"""
-        # Determine strike interval based on symbol
+    def get_strike_interval(self, symbol: str) -> int:
+        """Get strike interval for symbol"""
         intervals = {
             "NIFTY": 50,
             "BANKNIFTY": 100,
             "MIDCPNIFTY": 25,
             "FINNIFTY": 50
         }
+        return intervals.get(symbol, 100)
+    
+    async def filter_atm_strikes(self, contracts: List[Dict], current_price: float, symbol: str) -> Dict:
+        """Filter contracts to get ATM ±5 strikes with their data"""
+        interval = self.get_strike_interval(symbol)
         
-        interval = intervals.get(symbol, 100)  # Default 100 for stocks
-        
-        # Round to nearest strike
+        # Calculate ATM strike
         atm = round(current_price / interval) * interval
         
-        strikes = []
-        for i in range(-ATM_RANGE, ATM_RANGE + 1):
-            strikes.append(atm + (i * interval))
+        # Calculate strike range
+        min_strike = atm - (ATM_RANGE * interval)
+        max_strike = atm + (ATM_RANGE * interval)
         
-        return sorted(strikes)
+        logger.info(f"   🎯 ATM: {atm}, Range: {min_strike} to {max_strike}")
+        
+        # Separate CE and PE contracts
+        ce_contracts = {}
+        pe_contracts = {}
+        
+        for contract in contracts:
+            strike = contract.get("strike_price")
+            if min_strike <= strike <= max_strike:
+                instrument_key = contract.get("instrument_key")
+                option_type = contract.get("instrument_type")
+                
+                contract_data = {
+                    "strike": strike,
+                    "instrument_key": instrument_key,
+                    "trading_symbol": contract.get("trading_symbol"),
+                    "ltp": 0,
+                    "oi": 0,
+                    "volume": 0
+                }
+                
+                if option_type == "CE":
+                    ce_contracts[strike] = contract_data
+                elif option_type == "PE":
+                    pe_contracts[strike] = contract_data
+        
+        return {
+            "ce": ce_contracts,
+            "pe": pe_contracts,
+            "strikes": sorted(set(list(ce_contracts.keys()) + list(pe_contracts.keys())))
+        }
     
-    async def fetch_strike_data(self, symbol: str, expiry: str, strike: float, option_type: str) -> Dict:
-        """Fetch data for a specific strike"""
-        try:
-            # Build option instrument key
-            # Format: NFO|NIFTY24DEC19C24000
-            exp_date = datetime.strptime(expiry, "%Y-%m-%d")
-            exp_str = exp_date.strftime("%y%b%d").upper()
-            
-            opt_type = "C" if option_type == "CE" else "P"
-            strike_str = str(int(strike))
-            
-            instrument_key = f"NFO|{symbol}{exp_str}{opt_type}{strike_str}"
-            
-            # Get LTP
-            ltp = await self.client.get_ltp(instrument_key)
-            
-            # For OI and volume, we'd need market depth/quote endpoint
-            # Placeholder for now
-            oi = 0
-            volume = 0
-            
-            return {
-                "strike": strike,
-                "ltp": ltp,
-                "oi": oi,
-                "volume": volume
-            }
-            
-        except Exception as e:
-            logger.debug(f"Error fetching {option_type} {strike}: {e}")
-            return {
-                "strike": strike,
-                "ltp": 0,
-                "oi": 0,
-                "volume": 0
-            }
+    async def fetch_option_prices(self, contracts_data: Dict):
+        """Fetch LTP for all option contracts"""
+        # Fetch CE prices
+        for strike, contract in contracts_data["ce"].items():
+            ltp = await self.client.get_ltp(contract["instrument_key"])
+            contract["ltp"] = ltp
+            await asyncio.sleep(0.05)  # Rate limiting
+        
+        # Fetch PE prices
+        for strike, contract in contracts_data["pe"].items():
+            ltp = await self.client.get_ltp(contract["instrument_key"])
+            contract["ltp"] = ltp
+            await asyncio.sleep(0.05)  # Rate limiting
     
     async def analyze_symbol(self, symbol: str) -> Optional[Dict]:
         """Complete analysis for a symbol"""
@@ -284,38 +267,43 @@ class OptionAnalyzer:
             expiry = expiries[0]
             logger.info(f"   📅 Expiry: {expiry}")
             
-            # Get ATM strikes
-            strikes = await self.get_atm_strikes(current_price, symbol)
-            logger.info(f"   🎯 Strikes: {strikes[0]} to {strikes[-1]}")
+            # Get ALL option contracts for this expiry
+            contracts = await self.client.get_option_contracts(symbol, expiry)
             
-            # Fetch option data for all strikes
-            ce_data = []
-            pe_data = []
+            if not contracts:
+                logger.warning(f"⚠️ No option contracts found for {symbol}")
+                return None
             
-            for strike in strikes:
-                ce = await self.fetch_strike_data(symbol, expiry, strike, "CE")
-                pe = await self.fetch_strike_data(symbol, expiry, strike, "PE")
-                
-                ce_data.append(ce)
-                pe_data.append(pe)
-                
-                await asyncio.sleep(0.1)  # Rate limiting
+            # Filter ATM ±5 strikes
+            contracts_data = await self.filter_atm_strikes(contracts, current_price, symbol)
             
-            # Calculate PCR
+            if not contracts_data["strikes"]:
+                logger.warning(f"⚠️ No strikes found in ATM range")
+                return None
+            
+            logger.info(f"   🎯 Strikes: {contracts_data['strikes'][0]} to {contracts_data['strikes'][-1]}")
+            
+            # Fetch prices for all strikes
+            await self.fetch_option_prices(contracts_data)
+            
+            # Calculate PCR (OI data not available in LTP endpoint, will be 0)
+            ce_data = [contracts_data["ce"].get(s, {"strike": s, "ltp": 0, "oi": 0, "volume": 0}) for s in contracts_data["strikes"]]
+            pe_data = [contracts_data["pe"].get(s, {"strike": s, "ltp": 0, "oi": 0, "volume": 0}) for s in contracts_data["strikes"]]
+            
             total_ce_oi = sum(d["oi"] for d in ce_data)
             total_pe_oi = sum(d["oi"] for d in pe_data)
-            total_ce_vol = sum(d["volume"] for d in ce_data)
-            total_pe_vol = sum(d["volume"] for d in pe_data)
             
             pcr_oi = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-            pcr_vol = total_pe_vol / total_ce_vol if total_ce_vol > 0 else 0
+            pcr_vol = 0  # Volume data not available
+            
+            logger.info(f"   📊 CE count: {len(ce_data)}, PE count: {len(pe_data)}")
             
             return {
                 "symbol": symbol,
                 "current_price": current_price,
                 "expiry": expiry,
                 "candles": candles,
-                "strikes": strikes,
+                "strikes": contracts_data["strikes"],
                 "ce_data": ce_data,
                 "pe_data": pe_data,
                 "pcr_oi": pcr_oi,
@@ -399,13 +387,13 @@ class ChartGenerator:
             ]
             table_data.append(row)
         
-        # Add PCR row
+        # Add PCR row (OI will be N/A)
         table_data.append([
             "PCR",
             "",
             "",
-            f"OI: {analysis['pcr_oi']:.2f}",
-            f"Vol: {analysis['pcr_vol']:.2f}",
+            f"OI: N/A",
+            f"Vol: N/A",
             "",
             ""
         ])
@@ -434,7 +422,8 @@ class ChartGenerator:
             table[(pcr_row, i)].set_text_props(weight='bold')
         
         # Highlight ATM strike
-        atm_strike = round(current_price / 50) * 50  # Adjust based on symbol
+        interval = 50 if symbol == "NIFTY" else 100
+        atm_strike = round(current_price / interval) * interval
         for i, strike in enumerate(analysis["strikes"], 1):
             if strike == atm_strike:
                 for j in range(7):
@@ -507,9 +496,8 @@ class UpstoxOptionsBot:
         logger.info(f"🔍 ANALYSIS CYCLE - {datetime.now(IST).strftime('%H:%M:%S')}")
         logger.info("="*60)
         
-        # Test with INDICES ONLY first (stocks need ISIN codes)
-        test_symbols = INDICES  # Only indices for now
-        logger.info(f"📊 Testing {len(test_symbols)} indices (stocks disabled until ISIN mapping added)\n")
+        test_symbols = INDICES
+        logger.info(f"📊 Analyzing {len(test_symbols)} indices\n")
         
         for symbol in test_symbols:
             try:
@@ -540,11 +528,9 @@ class UpstoxOptionsBot:
     
     async def run(self):
         """Main bot loop"""
-        # Check current market status
         current_time = datetime.now(IST)
         market_status = "🟢 OPEN" if self.is_market_open() else "🔴 CLOSED"
         
-        # Flush startup message immediately
         print("\n" + "="*60, flush=True)
         print("🚀 UPSTOX OPTIONS BOT STARTED!", flush=True)
         print("="*60, flush=True)
@@ -552,7 +538,7 @@ class UpstoxOptionsBot:
         print(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}", flush=True)
         print(f"📊 Market Status: {market_status}", flush=True)
         print(f"⏱️  Analysis Interval: {ANALYSIS_INTERVAL // 60} minutes", flush=True)
-        print(f"📊 Symbols: {len(INDICES)} indices + {len(NIFTY50_STOCKS)} stocks", flush=True)
+        print(f"📊 Symbols: {len(INDICES)} indices", flush=True)
         print(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}", flush=True)
         print(f"🎯 ATM Range: ±{ATM_RANGE} strikes", flush=True)
         print("="*60 + "\n", flush=True)
@@ -566,7 +552,7 @@ class UpstoxOptionsBot:
         logger.info(f"🕐 Time: {current_time.strftime('%H:%M:%S IST')}")
         logger.info(f"📊 Market Status: {market_status}")
         logger.info(f"⏱️  Interval: {ANALYSIS_INTERVAL // 60} minutes")
-        logger.info(f"📊 Symbols: {len(INDICES)} indices + {len(NIFTY50_STOCKS)} stocks")
+        logger.info(f"📊 Symbols: {len(INDICES)} indices")
         logger.info(f"🕐 Market Hours: {MARKET_START} - {MARKET_END}")
         logger.info(f"🎯 ATM Range: ±{ATM_RANGE} strikes")
         logger.info("="*60 + "\n")
