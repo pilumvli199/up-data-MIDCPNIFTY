@@ -60,10 +60,10 @@ class CandlestickPatterns:
         if volume_avg and row['volume'] > 0:
             volume_strength = min(row['volume'] / volume_avg, 2.0)
         
-        # Hammer: small body, long lower wick, small upper wick
-        if (lower_wick > body * 2 and 
-            upper_wick < body * 0.3 and 
-            body < total_range * 0.3):
+        # Hammer: small body, long lower wick, small upper wick (RELAXED)
+        if (lower_wick > body * 1.5 and 
+            upper_wick < body * 0.5 and 
+            body < total_range * 0.4):
             strength = volume_strength
             return True, "🔨 HAMMER", strength
         return False, "", 0.0
@@ -83,9 +83,9 @@ class CandlestickPatterns:
         if volume_avg and row['volume'] > 0:
             volume_strength = min(row['volume'] / volume_avg, 2.0)
         
-        if (upper_wick > body * 2 and 
-            lower_wick < body * 0.3 and 
-            body < total_range * 0.3):
+        if (upper_wick > body * 1.5 and 
+            lower_wick < body * 0.5 and 
+            body < total_range * 0.4):
             strength = volume_strength
             return True, "⭐ SHOOTING STAR", strength
         return False, "", 0.0
@@ -103,8 +103,9 @@ class CandlestickPatterns:
         if volume_avg and row['volume'] > 0:
             volume_strength = min(row['volume'] / volume_avg, 2.0)
         
-        if body < total_range * 0.1:
-            strength = volume_strength * 0.8  # Doji less reliable
+        # Doji: very small body (RELAXED)
+        if body < total_range * 0.15:
+            strength = volume_strength * 0.8
             return True, "✖️ DOJI", strength
         return False, "", 0.0
     
@@ -121,21 +122,21 @@ class CandlestickPatterns:
         if volume_avg and row['volume'] > 0:
             volume_strength = min(row['volume'] / volume_avg, 2.0)
         
-        # Bullish engulfing
+        # Bullish engulfing (RELAXED)
         if (row['close'] > row['open'] and 
             prev_row['close'] < prev_row['open'] and
             row['open'] <= prev_row['close'] and
             row['close'] >= prev_row['open'] and
-            curr_body > prev_body * 1.2):
-            strength = volume_strength * 1.5  # Strong pattern
+            curr_body > prev_body * 1.0):  # Changed from 1.2 to 1.0
+            strength = volume_strength * 1.5
             return True, "🟢 BULLISH ENGULFING", strength
         
-        # Bearish engulfing
+        # Bearish engulfing (RELAXED)
         if (row['close'] < row['open'] and 
             prev_row['close'] > prev_row['open'] and
             row['open'] >= prev_row['close'] and
             row['close'] <= prev_row['open'] and
-            curr_body > prev_body * 1.2):
+            curr_body > prev_body * 1.0):  # Changed from 1.2 to 1.0
             strength = volume_strength * 1.5
             return True, "🔴 BEARISH ENGULFING", strength
         
@@ -284,8 +285,8 @@ class CandlestickPatterns:
 # ======================== SUPPORT & RESISTANCE DETECTOR ========================
 class SupportResistance:
     @staticmethod
-    def find_pivot_points(df, window=5) -> Tuple[List, List]:
-        """Find pivot highs and lows - stronger with bigger window"""
+    def find_pivot_points(df, window=3) -> Tuple[List, List]:
+        """Find pivot highs and lows - smaller window for more levels"""
         highs = []
         lows = []
         
@@ -299,8 +300,8 @@ class SupportResistance:
         return highs, lows
     
     @staticmethod
-    def cluster_levels(levels, tolerance=0.003) -> List[float]:
-        """Cluster nearby levels - tighter clustering"""
+    def cluster_levels(levels, tolerance=0.005) -> List[float]:
+        """Cluster nearby levels - relaxed tolerance"""
         if not levels:
             return []
         
@@ -329,12 +330,12 @@ class SupportResistance:
         resistance_levels = SupportResistance.cluster_levels(high_prices)
         support_levels = SupportResistance.cluster_levels(low_prices)
         
-        # Filter and get top 3 each
+        # Filter and get top 5 each
         resistance_levels = [r for r in resistance_levels if r > current_price]
         support_levels = [s for s in support_levels if s < current_price]
         
-        resistance_levels = sorted(resistance_levels)[:3]
-        support_levels = sorted(support_levels, reverse=True)[:3]
+        resistance_levels = sorted(resistance_levels)[:5]
+        support_levels = sorted(support_levels, reverse=True)[:5]
         
         return {
             "resistance": resistance_levels,
@@ -361,33 +362,46 @@ class ConfluenceAnalyzer:
         at_support = any(abs(pattern_price - s) / s < 0.005 for s in sr_levels['support'])
         at_resistance = any(abs(pattern_price - r) / r < 0.005 for r in sr_levels['resistance'])
         
-        # S/R match (2 points)
+        # S/R match (2 points) - RELAXED proximity check
         if pattern_type == 'bullish' and at_support:
             score += 2
             reasons.append("Pattern at Support")
         elif pattern_type == 'bearish' and at_resistance:
             score += 2
             reasons.append("Pattern at Resistance")
+        elif pattern_type == 'bullish' and support_levels:
+            # Give partial points if near any support (within 1%)
+            if any(abs(pattern_price - s) / s < 0.01 for s in sr_levels['support']):
+                score += 1
+                reasons.append("Near Support")
+        elif pattern_type == 'bearish' and resistance_levels:
+            # Give partial points if near any resistance (within 1%)
+            if any(abs(pattern_price - r) / r < 0.01 for r in sr_levels['resistance']):
+                score += 1
+                reasons.append("Near Resistance")
         
-        # PCR confirmation (2 points)
-        if pattern_type == 'bullish' and strike_pcr > 1.3:
+        # PCR confirmation (2 points) - RELAXED thresholds
+        if pattern_type == 'bullish' and strike_pcr > 1.2:  # Changed from 1.3
             score += 2
             reasons.append(f"High PCR ({strike_pcr:.2f})")
-        elif pattern_type == 'bearish' and strike_pcr < 0.7:
+        elif pattern_type == 'bearish' and strike_pcr < 0.8:  # Changed from 0.7
             score += 2
             reasons.append(f"Low PCR ({strike_pcr:.2f})")
-        elif pattern_type == 'bullish' and strike_pcr > 1.0:
+        elif pattern_type == 'bullish' and strike_pcr > 0.9:  # Changed from 1.0
             score += 1
             reasons.append(f"Moderate PCR ({strike_pcr:.2f})")
-        elif pattern_type == 'bearish' and strike_pcr < 1.0:
+        elif pattern_type == 'bearish' and strike_pcr < 1.1:  # Changed from 1.0
             score += 1
             reasons.append(f"Moderate PCR ({strike_pcr:.2f})")
         
-        # Volume confirmation (1 point)
+        # Volume confirmation (1 point) - RELAXED
         volume_ratio = futures_volume / avg_volume if avg_volume > 0 else 1.0
-        if volume_ratio > 1.5:
+        if volume_ratio > 1.2:  # Changed from 1.5
             score += 1
             reasons.append(f"High Volume ({volume_ratio:.1f}x)")
+        elif volume_ratio > 0.8:  # Add partial point for normal volume
+            score += 0.5
+            reasons.append(f"Normal Volume")
         
         # Strength
         if score >= 4:
@@ -409,8 +423,8 @@ class TradingSignals:
     def generate_signal(pattern: Dict, confluence: Dict, current_price: float, strike: int, ce_ltp: float, pe_ltp: float) -> Optional[Dict]:
         """Generate trading signal with Entry/SL/Target"""
         
-        # Only generate for MODERATE/STRONG confluence
-        if confluence['score'] < 2:
+        # Generate for score >= 1.5 (RELAXED from 2)
+        if confluence['score'] < 1.5:
             return None
         
         pattern_type = pattern['type']
@@ -1068,7 +1082,7 @@ class ChartGenerator:
         interval = 50 if symbol == "NIFTY" else (100 if symbol == "BANKNIFTY" else 50)
         atm_strike = round(current_price / interval) * interval
         
-        table_data = [["Strike", "PE OI", "CE OI", "PCR", "CE LTP", "PE LTP", "Signal"]]
+        table_data = [["Strike", "PE OI", "CE OI", "PCR", "CE LTP", "PE LTP", "Signal", "Action"]]
         
         for i, strike in enumerate(analysis["strikes"]):
             ce = analysis["ce_data"][i]
@@ -1076,18 +1090,25 @@ class ChartGenerator:
             
             pcr = pe.get("pcr", 0)
             
-            if pcr > 2.0:
-                signal = "🟢🟢 STRONG BUY"
+            # Signal classification
+            if pcr > 2.5:
+                signal = "🟢🟢 STRONG SUPPORT"
+                action = "Buy zone"
             elif pcr > 1.5:
                 signal = "🟢 Bullish"
+                action = "Slight bull"
             elif pcr > 1.1:
-                signal = "⚪ Slight Bull"
+                signal = "⚪ Neutral+"
+                action = "Slight bull"
             elif pcr >= 0.9:
-                signal = "⚪ Neutral"
+                signal = "⚪ Balanced"
+                action = "Watch"
             elif pcr >= 0.6:
-                signal = "🔴 Bearish"
+                signal = "🔴 Resistance"
+                action = "Bearish"
             else:
-                signal = "🔴🔴 STRONG SELL"
+                signal = "🔴🔴 STRONG"
+                action = "Sell zone"
             
             row = [
                 f"₹{strike:,.0f}{' *ATM*' if strike == atm_strike else ''}",
@@ -1096,7 +1117,8 @@ class ChartGenerator:
                 f"{pcr:.2f}",
                 f"₹{ce['ltp']:.2f}",
                 f"₹{pe['ltp']:.2f}",
-                signal
+                signal,
+                action
             ]
             table_data.append(row)
         
@@ -1120,14 +1142,15 @@ class ChartGenerator:
             f"{overall_pcr:.2f}",
             "",
             "",
-            market_signal
+            market_signal,
+            "See above"
         ])
         
         table = ax_table.table(
             cellText=table_data,
             loc='center',
             cellLoc='center',
-            colWidths=[0.14, 0.13, 0.13, 0.10, 0.12, 0.12, 0.16]
+            colWidths=[0.12, 0.12, 0.12, 0.08, 0.11, 0.11, 0.20, 0.14]  # 8 columns
         )
         
         table.auto_set_font_size(False)
@@ -1135,20 +1158,20 @@ class ChartGenerator:
         table.scale(1, 3)
         
         # Style header
-        for i in range(7):
+        for i in range(8):  # Changed from 7 to 8
             table[(0, i)].set_facecolor('#2c3e50')
             table[(0, i)].set_text_props(weight='bold', color='white', fontsize=12)
         
         # Style summary row
         summary_row = len(table_data) - 1
-        for i in range(7):
+        for i in range(8):  # Changed from 7 to 8
             table[(summary_row, i)].set_facecolor('#f39c12')
             table[(summary_row, i)].set_text_props(weight='bold', fontsize=12)
         
         # Highlight ATM
         for i, strike in enumerate(analysis["strikes"], 1):
             if strike == atm_strike:
-                for j in range(7):
+                for j in range(8):  # Changed from 7 to 8
                     table[(i, j)].set_facecolor('#d4edda')
         
         plt.tight_layout()
