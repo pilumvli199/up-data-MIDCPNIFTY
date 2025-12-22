@@ -124,16 +124,24 @@ class UpstoxClient:
                 "expiry_date": expiry
             }
             
-            logger.debug(f"   📡 Fetching option contracts from: {url}")
-            logger.debug(f"   📡 Params: {params}")
+            logger.debug(f"   📡 Fetching option contracts")
+            logger.debug(f"      Underlying: {instrument_key}")
+            logger.debug(f"      Expiry: {expiry}")
             
             async with self.session.get(url, params=params) as response:
-                data = await response.json()
+                response_text = await response.text()
+                data = json.loads(response_text)
                 
-                if data.get("status") == "success" and data.get("data"):
-                    contracts = data["data"]
-                    logger.info(f"   ✅ Fetched {len(contracts)} option contracts")
-                    return contracts
+                if data.get("status") == "success":
+                    contracts = data.get("data", [])
+                    
+                    if contracts:
+                        logger.info(f"   ✅ Fetched {len(contracts)} option contracts")
+                        return contracts
+                    else:
+                        # Try with next expiry if no contracts found
+                        logger.warning(f"   ⚠️ No contracts for {expiry}, this might not be a valid expiry")
+                        return []
                 else:
                     logger.error(f"   ❌ API Error: {data}")
                     return []
@@ -145,18 +153,23 @@ class UpstoxClient:
             return []
     
     async def get_expiries(self, symbol: str) -> List[str]:
-        """Get available expiries for symbol"""
+        """Get available expiries for symbol - returns next 2 Thursdays"""
         try:
             today = datetime.now(IST).date()
+            expiries = []
             
             # Find next Thursday
             days_ahead = (3 - today.weekday()) % 7  # Thursday = 3
             if days_ahead == 0:
                 days_ahead = 7
             
-            next_expiry = today + timedelta(days=days_ahead)
+            # Get next 2 Thursdays (weekly expiries)
+            for i in range(2):
+                next_expiry = today + timedelta(days=days_ahead + (i * 7))
+                expiries.append(next_expiry.strftime("%Y-%m-%d"))
             
-            return [next_expiry.strftime("%Y-%m-%d")]
+            logger.debug(f"   📅 Available expiries: {expiries}")
+            return expiries
             
         except Exception as e:
             logger.error(f"❌ Error calculating expiry: {e}")
@@ -264,14 +277,23 @@ class OptionAnalyzer:
                 logger.warning(f"⚠️ No expiry found for {symbol}")
                 return None
             
-            expiry = expiries[0]
-            logger.info(f"   📅 Expiry: {expiry}")
+            # Try each expiry until we find contracts
+            contracts = []
+            expiry = None
             
-            # Get ALL option contracts for this expiry
-            contracts = await self.client.get_option_contracts(symbol, expiry)
+            for exp_date in expiries:
+                logger.info(f"   📅 Trying expiry: {exp_date}")
+                contracts = await self.client.get_option_contracts(symbol, exp_date)
+                
+                if contracts:
+                    expiry = exp_date
+                    logger.info(f"   ✅ Using expiry: {expiry}")
+                    break
+                else:
+                    logger.warning(f"   ⚠️ No contracts for {exp_date}, trying next...")
             
-            if not contracts:
-                logger.warning(f"⚠️ No option contracts found for {symbol}")
+            if not contracts or not expiry:
+                logger.warning(f"⚠️ No valid option contracts found for {symbol}")
                 return None
             
             # Filter ATM ±5 strikes
